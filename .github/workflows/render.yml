@@ -1,16 +1,23 @@
 name: Render story
 
-# Push a script to scripts/ and GitHub renders the video for you.
-# You can also trigger a run by hand from the Actions tab.
+# Two ways to make a video:
+#   1. Actions tab -> Render story -> Run workflow -> paste your story -> Run.
+#   2. Add a .txt script under scripts/ and push it.
 on:
   push:
     paths:
       - "scripts/**.txt"
   workflow_dispatch:
     inputs:
-      script:
-        description: "Script to render (e.g. scripts/my-story.txt). Blank = every script."
+      story:
+        description: "Paste your whole story here (# title, ## scene, then narration). This is all you need."
         required: false
+        type: string
+        default: ""
+      script:
+        description: "Advanced: render an existing file instead, e.g. scripts/my-story.txt. Leave blank if you pasted above."
+        required: false
+        type: string
         default: ""
 
 # gh release create needs to write to the repo
@@ -49,13 +56,26 @@ jobs:
 
       - name: Work out which scripts to render
         id: pick
+        env:
+          STORY: ${{ github.event.inputs.story }}
         run: |
           set -euo pipefail
-          if [ -n "${{ github.event.inputs.script }}" ]; then
-            # Manual run naming a single script
+          if [ -n "${STORY:-}" ]; then
+            # Pasted story: save it as a script and render just that one.
+            mkdir -p scripts
+            title="$(printf '%s\n' "$STORY" | grep -m1 '^#[^#]' | sed 's/^#*//;s/^ *//' || true)"
+            slug="$(printf '%s' "${title:-story}" | tr '[:upper:]' '[:lower:]' \
+                    | tr -cs 'a-z0-9' '-' | sed 's/^-*//;s/-*$//' | cut -c1-50)"
+            [ -z "$slug" ] && slug="story"
+            file="scripts/${slug}.txt"
+            printf '%s\n' "$STORY" > "$file"
+            echo "Saved pasted story to $file"
+            targets="$file"
+          elif [ -n "${{ github.event.inputs.script }}" ]; then
+            # Advanced: render one named file
             targets="${{ github.event.inputs.script }}"
           elif [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
-            # Manual run with no script named: do them all
+            # Manual run with nothing specified: do them all
             targets="$(ls scripts/*.txt 2>/dev/null || true)"
           else
             # Push: only what actually changed in this push
@@ -102,13 +122,17 @@ jobs:
           if-no-files-found: error
 
       # A release gives every video a permanent download link, so you don't
-      # have to dig through Actions runs to find one.
+      # have to dig through Actions runs to find one. The newest release is
+      # always shown at the top of the repo's home page.
       - name: Publish release
         if: steps.pick.outputs.found == 'true'
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           tag="render-${{ github.run_number }}"
+          name="$(ls videos/*.mp4 | head -1 | xargs basename | sed 's/\.mp4$//')"
           gh release create "$tag" videos/*.mp4 \
-            --title "Videos · run ${{ github.run_number }}" \
-            --notes "Rendered from \`${{ github.ref_name }}\` @ \`${{ github.sha }}\`."
+            --title "🎬 ${name} (run ${{ github.run_number }})" \
+            --notes "Your video is attached below — click the .mp4 to download.
+
+          Rendered $(date -u '+%Y-%m-%d %H:%M UTC')."

@@ -80,19 +80,43 @@ For long-form, render on a branch or trigger it by hand from the Actions tab
 rather than on every push, and keep each scene's narration to a few sentences
 so captions stay readable.
 
-## Rendering on GitHub
+## Making a video on GitHub
 
-1. Add your script to `scripts/` and push it.
-2. The **Render story** workflow starts on its own.
-3. When it finishes, the video is attached to a new release, and also available
-   as a run artifact under the Actions tab.
+You never touch the command line. Everything happens on the repo's website.
 
-Only the scripts changed by that push are rendered. To re-render something, go
-to **Actions → Render story → Run workflow** and either name a script
-(`scripts/my-story.txt`) or leave it blank to rebuild everything.
+**1. Open the Actions tab.**
+Go to the repo, then click **Actions** in the row of tabs at the top
+(Code · Issues · Pull requests · Actions · …).
 
-A run takes roughly 10–25 minutes depending on how long the story is — most of
-it is waiting on image generation.
+**2. Pick the workflow.**
+In the left sidebar click **Render story**.
+
+**3. Click "Run workflow".**
+A grey **Run workflow ▾** button is on the right, just above the list of past
+runs. Click it and a small panel drops down.
+
+**4. Paste your story into the first box.**
+The box labelled *"Paste your whole story here"* is where the video comes from.
+Type or paste the whole story — title, scenes, narration — using the format
+below. Ignore the second box; it is only for advanced use.
+
+**5. Click the green "Run workflow" button** at the bottom of the panel.
+
+That is it. A new run appears in the list. Click it to watch progress; when the
+tick turns green (10–25 minutes for a short story, longer for a long one) your
+video is ready.
+
+**6. Download the video.**
+Go back to the repo home page — the finished video shows on the right under
+**Releases** (newest at the top). Click the release, then click the `.mp4` file
+to download it. Every video you make is kept there, so you can come back to old
+ones any time.
+
+### The other way: push a file
+
+If you prefer working in files, add a `.txt` script under `scripts/` and commit
+it — the render starts on its own, and only the script you changed is rendered.
+This is handy once you have a lot of stories and want them version-controlled.
 
 ## Rendering locally
 
