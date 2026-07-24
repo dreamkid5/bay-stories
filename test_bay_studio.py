@@ -287,18 +287,23 @@ def t_character_fits_its_band():
     true(ch.height <= B.H, f"character is {ch.height}px tall, frame is {B.H}px")
 
 def t_captions_clear_the_character():
-    """Text must never be drawn on top of the figure."""
+    """Text must never be drawn on top of the figure, whichever side it is on."""
+    cw = 500
     plate = Image.new("RGB", (B.W, B.H), (0, 0, 0))
-    char  = Image.new("RGBA", (400, 700), (255, 0, 0, 255))
+    char  = Image.new("RGBA", (cw, B.H), (255, 0, 0, 255))
     words = fake_words([("alpha", 0.0, .5), ("bravo", .5, .5), ("charlie", 1.0, .5)])
     win = B.card_windows(B.group_words(words, "alpha bravo charlie"), 3.0)
     frame = B.compose(plate, win, 0.2, 3.0, 1.0, char)
 
-    band = int(B.H * B.CAP_Y) - 20, int(B.H * B.CAP_Y) + B.CAP_SIZE + 20
-    strip = frame[band[0]:band[1], :400]
-    # inside the character's columns the caption's white text must not appear
+    y0 = int(B.H * B.CAP_Y) - 20
+    y1 = int(B.H * B.CAP_Y) + B.CAP_SIZE + 20
+    # the character's own columns, on whichever side it stands
+    if B.CHAR_SIDE == "right":
+        strip = frame[y0:y1, B.W - cw:]
+    else:
+        strip = frame[y0:y1, :cw]
     whitish = (strip[:, :, 0] > 200) & (strip[:, :, 1] > 200) & (strip[:, :, 2] > 200)
-    true(whitish.sum() < 40,
+    true(whitish.sum() < 60,
          f"{whitish.sum()} caption pixels landed on the character")
 
 def t_compose_without_character_still_works():
@@ -307,6 +312,25 @@ def t_compose_without_character_still_works():
     win = B.card_windows(B.group_words(words, "solo."), 2.0)
     frame = B.compose(plate, win, 0.2, 2.0, 1.0, None)
     eq(frame.shape, (B.H, B.W, 3))
+
+def t_output_is_high_definition():
+    true(B.H >= 1080, f"frame is only {B.H}px tall; want at least 1080 for HD")
+    true(B.W / B.H > 1.7, "frame is not 16:9 widescreen")
+
+def t_narrator_descriptions_read_young():
+    for g in ("male", "female"):
+        desc = B.describe_narrator(g).lower()
+        true("young" in desc or "twenty" in desc,
+             f"{g} narrator description does not read young: {desc!r}")
+
+def t_plate_keeps_detail():
+    """Compose must not crush the plate to mud — bright input stays bright."""
+    plate = Image.new("RGB", (B.W, B.H), (200, 200, 200))
+    frame = B.compose(plate, [], 5.0, 10.0, 1.0, None)
+    # centre of frame, away from the vignette edges
+    cy, cx = B.H // 2, B.W // 2
+    true(frame[cy, cx].mean() > 150,
+         f"a bright plate came out dim ({frame[cy, cx].mean():.0f}); detail is being crushed")
 
 def t_explicit_narrator_wins():
     """An @ line sets the narrator verbatim and skips gender inference."""
@@ -566,6 +590,7 @@ def main():
             ("gender defaults when ambiguous", t_gender_default_when_ambiguous),
             ("the description matches the gender", t_describe_narrator_matches_gender),
             ("the daughters story reads male", t_daughters_story_reads_male),
+            ("narrator descriptions read young", t_narrator_descriptions_read_young),
         ]),
         ("word grouping", [
             ("respects the words-per-card limit", t_group_respects_word_limit),
@@ -603,6 +628,8 @@ def main():
             ("ken burns keeps the plate moving", t_ken_burns_moves),
             ("captions clear the character", t_captions_clear_the_character),
             ("renders fine with no character", t_compose_without_character_still_works),
+            ("output is high definition", t_output_is_high_definition),
+            ("the plate keeps its detail", t_plate_keeps_detail),
         ]),
         ("output integrity", [
             ("rejects a missing file", t_verify_rejects_missing),

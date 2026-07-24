@@ -33,17 +33,18 @@ from PIL import Image, ImageDraw, ImageFont, ImageFilter
 HERE = os.path.dirname(os.path.abspath(__file__))
 
 # ── look ──────────────────────────────────────────────────────────────
-W, H, FPS = 1280, 720, 30
+W, H, FPS = 1920, 1080, 30           # full HD — plates keep their detail
 VOICE     = "en-US-ChristopherNeural"
 RATE      = "-6%"
 PITCH     = "-3Hz"
 
-CAP_SIZE     = 62                    # caption cap height
-CAP_Y        = 0.585                 # caption baseline, fraction of height
+CAP_SIZE     = 92                    # caption cap height (scaled for 1080p)
+CAP_Y        = 0.62                  # caption baseline, fraction of height
 WORDS_PER_LINE = 4                   # words visible at once
 HILITE       = (124, 42, 232)        # pill behind the spoken word
-STROKE       = 9                     # black outline thickness
-CHAR_BAND    = 0.34                  # width of the frame the character may use
+CHAR_BAND    = 0.30                  # width of the frame the narrator may use
+CHAR_SIDE    = "right"               # which side the narrator stands on
+PLATE_DARKEN = 0.94                  # how much to dim the plate (1.0 = none)
 
 FONT_CANDIDATES = [
     os.path.join(HERE, "fonts", "Poppins-ExtraBold.ttf"),   # shipped in this repo
@@ -136,23 +137,29 @@ def infer_gender(text):
     return "male"
 
 def describe_narrator(gender):
-    """A neutral, believable host for the given gender."""
+    """A young, believable host for the given gender (roughly 16–22)."""
     if gender == "female":
-        return ("a woman in her late thirties, simple elegant blouse, warm "
-                "composed thoughtful expression, natural makeup")
-    return ("a man in his late thirties, simple collared shirt, calm weathered "
-            "thoughtful expression")
+        return ("a young woman around twenty years old, youthful face, simple "
+                "elegant blouse, warm composed expression, natural makeup")
+    return ("a young man around twenty years old, youthful face, simple "
+            "collared shirt, calm thoughtful expression")
 
 # ── image plates ──────────────────────────────────────────────────────
-STYLE = ("cinematic film still, photorealistic, natural lighting, "
-         "shallow depth of field, colour graded, 4k, no text, no watermark")
+# People in scenes read as young adults (roughly 16–22) unless the scene text
+# itself says otherwise — an explicit "elderly" in a prompt still wins.
+STYLE = ("everyone in frame is a young adult aged sixteen to twenty two, "
+         "youthful faces, cinematic film still, photorealistic, natural "
+         "lighting, shallow depth of field, colour graded, high resolution, "
+         "sharp detail, 4k, no text, no watermark")
 
 def fetch_plate(prompt, path, seed):
     if os.path.exists(path) and os.path.getsize(path) > 5000:
         return path
     full = f"{prompt}, {STYLE}"
+    # Fetch at full output resolution so the plate keeps its detail; a smaller
+    # image upscaled into the frame is exactly the soft, compressed look to avoid.
     url = (f"https://image.pollinations.ai/prompt/{urllib.parse.quote(full)}"
-           f"?width={W}&height={H}&model=flux&nologo=true&seed={seed}")
+           f"?width={W}&height={H}&model=flux&nologo=true&enhance=true&seed={seed}")
     for _ in range(3):
         try:
             req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
@@ -186,17 +193,18 @@ def fit(img, max_w, max_h):
 # studio backdrop seems tidier but cannot be separated reliably: a white shirt
 # on a white wall is genuinely ambiguous to any colour-matching cutout, and the
 # clothes get eaten along with the background. Nothing on a person is green.
-CHAR_STYLE = ("full body shot, standing, facing camera, whole figure visible "
-              "with empty space on both sides, solid chroma key green screen "
-              "background, bright even studio lighting, photorealistic, "
-              "sharp focus, 8k, no text, no watermark")
+CHAR_STYLE = ("medium shot, waist up portrait, head and torso filling the "
+              "frame, facing camera, solid chroma key green screen background, "
+              "bright even studio lighting, photorealistic, sharp focus, "
+              "high resolution, 8k, no text, no watermark")
 
 def fetch_character(prompt, path, seed):
     if os.path.exists(path) and os.path.getsize(path) > 5000:
         return path
     full = f"{prompt}, {CHAR_STYLE}"
+    # Generated large so the keyed cutout stays crisp when placed in the frame.
     url = (f"https://image.pollinations.ai/prompt/{urllib.parse.quote(full)}"
-           f"?width=576&height=864&model=flux&nologo=true&seed={seed}")
+           f"?width=896&height=1344&model=flux&nologo=true&enhance=true&seed={seed}")
     for _ in range(3):
         try:
             req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
@@ -289,7 +297,7 @@ def largest_blob(img):
     return Image.fromarray(out)
 
 def prepare_character(path):
-    """Key the figure out and size it for the left of the frame."""
+    """Key the figure out and size it as a medium shot for one side of the frame."""
     if not path or not os.path.exists(path):
         return None
     cut = largest_blob(chroma_key(Image.open(path)))
@@ -300,15 +308,16 @@ def prepare_character(path):
     if bbox:
         cut = cut.crop(bbox)
 
-    # Stand the figure full-height. Sizing on width instead would leave a
-    # waist-up portrait stranded in the bottom half of the frame.
+    # Size on height so a waist-up medium shot stands nearly full-frame, the
+    # way the narrator sits large in the reference. Uniform scale — never
+    # stretched or squeezed.
     target_h = int(H * 0.97)
     scale    = target_h / cut.height
     cut = cut.resize((max(1, round(cut.width * scale)), target_h), Image.LANCZOS)
 
-    # A waist-up shot comes out near-square and would swallow half the frame.
-    # Crop the sides to the character band, keeping the subject's own centre
-    # of mass in view — the same call a camera operator makes framing a guest.
+    # A medium shot is roughly torso-wide and would spill past its band. Crop
+    # the sides to the band, keeping the subject's centre of mass framed — the
+    # same call a camera operator makes framing a guest.
     band = int(W * CHAR_BAND)
     if cut.width > band:
         alpha = np.array(cut.getchannel("A")) > 40
@@ -317,11 +326,15 @@ def prepare_character(path):
         left   = int(np.clip(centre - band // 2, 0, cut.width - band))
         cut = cut.crop((left, 0, left + band, cut.height))
 
-        # If the crop sliced through the figure it leaves a hard vertical
-        # edge, which reads as a torn photograph. Fade the cut side out.
+        # A straight crop leaves a hard vertical edge that reads as a torn
+        # photo. Feather the INNER edge — the one facing the captions — so the
+        # figure melts into the scene. Which edge that is depends on the side.
         arr  = np.array(cut).astype(np.float32)
-        ramp = int(band * 0.10)
-        arr[:, -ramp:, 3] *= np.linspace(1, 0, ramp)[None, :]
+        ramp = int(band * 0.12)
+        if CHAR_SIDE == "right":
+            arr[:, :ramp, 3] *= np.linspace(0, 1, ramp)[None, :]
+        else:
+            arr[:, -ramp:, 3] *= np.linspace(1, 0, ramp)[None, :]
         cut  = Image.fromarray(arr.astype(np.uint8))
     return cut
 
@@ -486,22 +499,26 @@ def card_windows(cards, dur):
 # ── caption drawing ───────────────────────────────────────────────────
 _font = load_font(CAP_SIZE)
 
-def draw_caption(frame, card, t, band_left=0):
+def draw_caption(frame, card, t, band_left=0, band_right=None):
     """
     Draw one caption card, pill-highlighting the word being spoken.
 
-    `band_left` is where the usable width starts. When a character stands on
-    the left, captions centre in the space beside them instead of the whole
-    frame, so text never lands on top of the figure.
+    `band_left`/`band_right` bound the usable width. When the narrator stands
+    on one side, captions centre in the clear space beside them instead of the
+    whole frame, so text never lands on the figure. Every measurement derives
+    from CAP_SIZE, so the whole caption scales with one number.
     """
+    if band_right is None:
+        band_right = W
     d = ImageDraw.Draw(frame)
     words = [w[2].upper().strip() for w in card]
-    # Word gap must clear the pill padding plus the outline on both sides,
-    # or a neighbour's stroke eats into the highlight.
-    gap   = 40
 
-    band_w = W - band_left
-    max_w  = band_w * 0.90
+    # Everything sized off the cap height, so 720p and 1080p look identical.
+    gap    = int(CAP_SIZE * 0.62)      # clears the pill padding + outline
+    stroke = max(3, int(CAP_SIZE * 0.14))
+
+    band_w = band_right - band_left
+    max_w  = band_w * 0.92
 
     widths = [d.textlength(w, font=_font) for w in words]
     total  = sum(widths) + gap * (len(words) - 1)
@@ -509,10 +526,11 @@ def draw_caption(frame, card, t, band_left=0):
     # shrink to fit if a card runs wide
     fnt, scale = _font, 1.0
     if total > max_w:
-        scale = max_w / total
-        fnt   = load_font(max(24, int(CAP_SIZE * scale)))
+        scale  = max_w / total
+        fnt    = load_font(max(24, int(CAP_SIZE * scale)))
         widths = [d.textlength(w, font=fnt) for w in words]
-        gap    = max(12, int(gap * scale))
+        gap    = max(10, int(gap * scale))
+        stroke = max(3, int(stroke * scale))
         total  = sum(widths) + gap * (len(words) - 1)
 
     x = band_left + (band_w - total) / 2
@@ -520,7 +538,7 @@ def draw_caption(frame, card, t, band_left=0):
 
     # Pill bounds come from the actual cap-height of the drawn glyphs, not the
     # font's full ascent+descent — otherwise it hangs well below the text.
-    ref_bb  = d.textbbox((0, y), "AWJ", font=fnt)
+    ref_bb   = d.textbbox((0, y), "AWJ", font=fnt)
     top, bot = ref_bb[1], ref_bb[3]
 
     # Two passes: every pill first, then every word. Drawing pill-then-word
@@ -529,57 +547,99 @@ def draw_caption(frame, card, t, band_left=0):
     for wdt in widths:
         xs.append(x); x += wdt + gap
 
-    pad_x, pad_y = int(16 * scale), int(10 * scale)
+    pad_x  = int(CAP_SIZE * 0.26 * scale)
+    pad_y  = int(CAP_SIZE * 0.16 * scale)
+    radius = int(CAP_SIZE * 0.26 * scale)
     for i, (start, dur, _) in enumerate(card):
         if start <= t < start + max(dur, 0.08):
             d.rounded_rectangle(
                 [xs[i] - pad_x, top - pad_y, xs[i] + widths[i] + pad_x, bot + pad_y],
-                radius=int(16 * scale), fill=(*HILITE, 255))
+                radius=radius, fill=(*HILITE, 255))
 
     for i, w in enumerate(words):
         d.text((xs[i], y), w, font=fnt, fill=(255, 255, 255, 255),
-               stroke_width=max(3, int(STROKE * scale)), stroke_fill=(0, 0, 0, 255))
+               stroke_width=stroke, stroke_fill=(0, 0, 0, 255))
 
 # ── frame composition ─────────────────────────────────────────────────
 def ken_burns(plate, t, dur):
-    """Slow push-in so a still plate never reads as frozen."""
-    z = 1.05 + 0.06 * (t / max(dur, 1e-3))
+    """
+    Slow push-in so a still plate never reads as frozen. The zoom is kept
+    shallow because every crop is upscaled back to the frame, and a big zoom
+    means a big upscale — which is the soft, compressed look we are avoiding.
+    """
+    z = 1.02 + 0.05 * (t / max(dur, 1e-3))
     cw, ch = int(W / z), int(H / z)
-    ox = int((W - cw) * (0.5 + 0.22 * np.sin(t * 0.13)))
-    oy = int((H - ch) * (0.5 + 0.16 * np.cos(t * 0.10)))
+    ox = int((W - cw) * (0.5 + 0.18 * np.sin(t * 0.13)))
+    oy = int((H - ch) * (0.5 + 0.14 * np.cos(t * 0.10)))
     return plate.crop((ox, oy, ox + cw, oy + ch)).resize((W, H), Image.LANCZOS)
+
+# A few dozen soft out-of-focus motes that drift slowly, matching the gentle
+# bokeh in the reference. Seeded once so the pattern is stable within a video.
+_prng = np.random.default_rng(7)
+_MOTES = [dict(x=_prng.random(), y=_prng.random(),
+               r=_prng.uniform(2, 7) * (H / 720),
+               a=_prng.uniform(0.05, 0.18),
+               sx=_prng.uniform(-0.006, 0.006),
+               sy=_prng.uniform(-0.010, -0.003),
+               ph=_prng.uniform(0, 6.28)) for _ in range(26)]
+
+def _draw_motes(frame, t):
+    # Drawn on their own layer and blurred so they read as soft out-of-focus
+    # bokeh rather than hard white dots.
+    layer = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+    d = ImageDraw.Draw(layer)
+    for m in _MOTES:
+        x = ((m["x"] + m["sx"] * t) % 1.0) * W
+        y = ((m["y"] + m["sy"] * t) % 1.0) * H
+        a = int(255 * m["a"] * (0.6 + 0.4 * np.sin(t * 0.8 + m["ph"])))
+        r = m["r"]
+        d.ellipse([x - r, y - r, x + r, y + r], fill=(255, 255, 255, max(0, a)))
+    frame.alpha_composite(layer.filter(ImageFilter.GaussianBlur(3)))
 
 def compose(plate, windows, t, dur, fade, character=None):
     frame = ken_burns(plate, t, dur).convert("RGBA")
 
-    # gentle top/bottom falloff — keeps captions legible on bright plates
+    # A light, even dim rather than the heavy darkening that used to flatten
+    # detail; plus a soft edge vignette so the frame has depth without murk.
     a = np.array(frame).astype(np.float32)
-    ramp = np.ones(H, dtype=np.float32)
-    ramp[: int(H * 0.18)] = np.linspace(0.72, 1.0, int(H * 0.18))
-    ramp[-int(H * 0.28):] = np.linspace(1.0, 0.68, int(H * 0.28))
-    a[:, :, :3] *= ramp[:, None, None]
+    a[:, :, :3] *= PLATE_DARKEN
+    yy, xx = np.meshgrid(np.linspace(-1, 1, H), np.linspace(-1, 1, W), indexing="ij")
+    vig = np.clip(1 - (yy ** 2 * 0.20 + xx ** 2 * 0.14), 0.70, 1.0)
+    a[:, :, :3] *= vig[:, :, None]
     frame = Image.fromarray(np.clip(a, 0, 255).astype(np.uint8))
 
-    band_left = 0
+    _draw_motes(frame, t)
+
+    band_left, band_right = 0, W
     if character is not None:
+        on_right = (CHAR_SIDE == "right")
+        cx = W - character.width if on_right else 0
+
         # Soften the plate behind the figure so a cut edge doesn't read as a
-        # sticker pasted onto a busy photograph.
+        # sticker pasted onto a busy photograph — gradient fading in from the
+        # side the narrator stands on.
         scrim = Image.new("RGBA", (W, H), (0, 0, 0, 0))
         sd = ImageDraw.Draw(scrim)
-        reach = int(character.width * 1.12)
+        reach = int(character.width * 1.15)
         for i in range(reach):
-            sd.line([(i, 0), (i, H)],
-                    fill=(8, 9, 14, int(120 * (1 - i / reach) ** 1.5)))
+            col = (8, 9, 14, int(130 * (1 - i / reach) ** 1.5))
+            xi = W - 1 - i if on_right else i
+            sd.line([(xi, 0), (xi, H)], fill=col)
         frame.alpha_composite(scrim)
 
         # Bottom-anchored: the frame edge crops the figure, the way a real
         # lower-third does. No fade — that reads as a dissolve, not a cutout.
-        frame.alpha_composite(character, (0, H - character.height))
-        band_left = int(character.width * 0.92)
+        frame.alpha_composite(character, (cx, H - character.height))
+
+        # Captions keep to the clear side.
+        if on_right:
+            band_right = int(W - character.width * 0.92)
+        else:
+            band_left = int(character.width * 0.92)
 
     for start, end, card in windows:
         if start <= t < end:
-            draw_caption(frame, card, t, band_left)
+            draw_caption(frame, card, t, band_left, band_right)
             break
 
     out = np.array(frame.convert("RGB"))
@@ -640,8 +700,10 @@ def build(script_path, out_path, work=None, keep_plates=False):
 
         clip = VideoClip(make, duration=dur).with_audio(AudioFileClip(sc["mp3"]))
         part = os.path.join(work, f"scene_{i}.mp4")
+        # High per-scene bitrate so no detail is lost before the final encode —
+        # at 1080p a low bitrate is itself a source of the compressed look.
         clip.write_videofile(part, fps=FPS, codec="libx264", audio_codec="aac",
-                             bitrate="8000k", audio_bitrate="192k",
+                             bitrate="14000k", audio_bitrate="192k",
                              logger="bar", threads=4)
         clip.close()
         # A scene that failed to finalise would poison the stitch with a
@@ -667,7 +729,7 @@ def build(script_path, out_path, work=None, keep_plates=False):
     try:
         r = subprocess.run([FFMPEG, "-y", *ins, "-filter_complex", fc,
                             "-map", "[v]", "-map", "[a]",
-                            "-c:v", "libx264", "-preset", "medium", "-crf", "19",
+                            "-c:v", "libx264", "-preset", "medium", "-crf", "17",
                             "-pix_fmt", "yuv420p",
                             "-c:a", "aac", "-b:a", "192k",
                             "-movflags", "+faststart", tmp],
