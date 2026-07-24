@@ -34,25 +34,51 @@ The `##` line is an image prompt. Describe the shot, not the story: who is in
 frame, where they are, what the light is doing. Cinematic styling is added for
 you, so there's no need to write "4k, cinematic, photorealistic".
 
-### Characters
+### The narrator
 
-The `@` line puts a cut-out figure on the left of the frame, and captions move
-over to sit beside them. Describe the person — age, clothing, expression.
+One narrator hosts the whole video — the same cut-out figure on the left of
+every scene, the way a presenter stays on screen while the story cuts around
+them. They are generated and keyed out once, then reused on every scene, so the
+face never changes and never distorts.
 
-A scene with no `@` keeps whoever was on screen before it, so a narrator who
-stays for the whole story is written once at the top. Give a scene a new `@`
-whenever the story turns to someone else, and the face changes with it. Repeat
-an earlier description word for word and that same figure comes back — the
-generated image is reused rather than made again.
+You do not have to write the narrator. Leave `@` out and one is chosen to fit
+the story: the script and title are scanned for how the storyteller refers to
+themselves — "as a mother", "my wife", "they called me dad" — and the
+narrator's gender follows. When a story gives no such cue it defaults to a male
+host. To set the narrator yourself, write a single `@` line anywhere:
 
-Leave `@` out of a script entirely and the video plays full-bleed with no
-figure at all.
+```
+@ a woman in her fifties, grey cardigan, tired kind eyes
+```
 
-Characters are generated against a green screen and keyed out. A white studio
+An explicit `@` always wins over the automatic guess, and only the first one
+counts — there is a single host, not one per scene.
+
+The figure is generated against a green screen and keyed out. A white studio
 backdrop looks tidier but cannot be cut reliably: a white shirt against a white
 wall is genuinely ambiguous, and the clothes get erased along with the wall.
 Nothing on a person is green, which is why the technique has survived in
 broadcast for seventy years.
+
+## Length
+
+There is no built-in limit — the video is as long as the script. Each scene is
+rendered and verified on its own and then joined, so memory use stays flat
+whether the story runs two minutes or fifty.
+
+Two practical limits for very long videos rendered on GitHub:
+
+- **Time.** A GitHub job may run up to 6 hours; the workflow is capped a little
+  under that. Rendering runs at roughly real-time-ish per scene plus image
+  generation, so a 50-minute story is a multi-hour run. It fits, but it is not
+  quick.
+- **Image generation.** A feature-length script is dozens of `##` scenes, each
+  a call to the image API. Calls are retried three times, but more scenes mean
+  more chances for a slow or failed one, which lengthens the run.
+
+For long-form, render on a branch or trigger it by hand from the Actions tab
+rather than on every push, and keep each scene's narration to a few sentences
+so captions stay readable.
 
 ## Rendering on GitHub
 

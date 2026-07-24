@@ -43,12 +43,13 @@ def t_parse_basic():
                 "## a busy street\nMore narration here.\n")
         p = f.name
     try:
-        title, scenes = B.parse_script(p)
+        title, narrator, scenes = B.parse_script(p)
         eq(title, "My Title", "title: ")
         eq(len(scenes), 2, "scene count: ")
         eq(scenes[0]["image"], "a quiet room")
         eq(scenes[0]["narration"], "Hello world. Second line.")
         eq(scenes[1]["narration"], "More narration here.")
+        true(narrator, "a narrator should always be chosen")
     finally:
         os.unlink(p)
 
@@ -58,7 +59,7 @@ def t_parse_multiline_narration():
         f.write("# T\n## img\nLine one.\nLine two.\nLine three.\n")
         p = f.name
     try:
-        _, scenes = B.parse_script(p)
+        _, _, scenes = B.parse_script(p)
         eq(len(scenes), 1)
         eq(scenes[0]["narration"], "Line one. Line two. Line three.")
     finally:
@@ -70,7 +71,7 @@ def t_parse_narration_before_scene():
         f.write("# T\nOrphan narration.\n")
         p = f.name
     try:
-        _, scenes = B.parse_script(p)
+        _, _, scenes = B.parse_script(p)
         eq(len(scenes), 1)
         true(scenes[0]["image"], "expected a default image prompt")
     finally:
@@ -81,7 +82,7 @@ def t_parse_blank_lines_ignored():
         f.write("# T\n\n\n## img\n\nNarration.\n\n\n")
         p = f.name
     try:
-        _, scenes = B.parse_script(p)
+        _, _, scenes = B.parse_script(p)
         eq(len(scenes), 1)
         eq(scenes[0]["narration"], "Narration.")
     finally:
@@ -106,7 +107,7 @@ def t_parse_real_scripts():
     files = [f for f in os.listdir(d) if f.endswith(".txt")] if os.path.isdir(d) else []
     true(files, "no scripts found to check")
     for f in files:
-        title, scenes = B.parse_script(os.path.join(d, f))
+        title, _, scenes = B.parse_script(os.path.join(d, f))
         true(title, f"{f}: no title")
         true(scenes, f"{f}: no scenes")
         for i, s in enumerate(scenes):
@@ -307,41 +308,73 @@ def t_compose_without_character_still_works():
     frame = B.compose(plate, win, 0.2, 2.0, 1.0, None)
     eq(frame.shape, (B.H, B.W, 3))
 
-def t_parse_character_directive():
+def t_explicit_narrator_wins():
+    """An @ line sets the narrator verbatim and skips gender inference."""
     with tempfile.NamedTemporaryFile("w", suffix=".txt", delete=False) as f:
-        f.write("# T\n## a kitchen\n@ a tired woman in her forties\nShe waited.\n")
+        f.write("# A Mother's Story\n@ a stern man with a grey beard\n"
+                "## a kitchen\nAs a mother I did everything. My husband left.\n")
         p = f.name
     try:
-        _, scenes = B.parse_script(p)
-        eq(scenes[0]["character"], "a tired woman in her forties")
-        eq(scenes[0]["narration"], "She waited.")
+        _, narrator, _ = B.parse_script(p)
+        eq(narrator, "a stern man with a grey beard",
+           "explicit @ must win over the female cues in the text: ")
     finally:
         os.unlink(p)
 
-def t_character_carries_between_scenes():
-    """A character written once stays on screen until a new one is named."""
+def t_first_narrator_line_wins():
+    """One host for the whole video: only the first @ counts."""
     with tempfile.NamedTemporaryFile("w", suffix=".txt", delete=False) as f:
-        f.write("# T\n## a\n@ the narrator\nOne.\n## b\nTwo.\n"
-                "## c\n@ a young man\nThree.\n## d\nFour.\n")
+        f.write("# T\n@ the first host\n## a\nOne.\n@ a different host\n## b\nTwo.\n")
         p = f.name
     try:
-        _, s = B.parse_script(p)
-        eq(s[0]["character"], "the narrator")
-        eq(s[1]["character"], "the narrator", "scene 2 should hold the previous face: ")
-        eq(s[2]["character"], "a young man")
-        eq(s[3]["character"], "a young man", "scene 4 should hold the previous face: ")
+        _, narrator, _ = B.parse_script(p)
+        eq(narrator, "the first host")
     finally:
         os.unlink(p)
 
-def t_no_character_directive_is_fine():
+def t_narrator_inferred_when_absent():
     with tempfile.NamedTemporaryFile("w", suffix=".txt", delete=False) as f:
         f.write("# T\n## a room\nNarration only.\n")
         p = f.name
     try:
-        _, s = B.parse_script(p)
-        eq(s[0]["character"], "", "expected no character when none is written")
+        _, narrator, _ = B.parse_script(p)
+        true(narrator, "a narrator must be chosen even with no @ line")
     finally:
         os.unlink(p)
+
+def t_gender_inference():
+    female = [
+        "As a mother I raised them alone.",
+        "My husband walked out on us.",
+        "I was a single mom for years.",
+        "They called me mom every night.",
+        "When I was pregnant with my first child.",
+    ]
+    male = [
+        "As a father I gave them everything.",
+        "My wife passed away last spring.",
+        "I was a single dad for years.",
+        "They called me dad every night.",
+        "Being a dad was all I ever wanted.",
+    ]
+    for txt in female:
+        eq(B.infer_gender(txt), "female", f"{txt!r} -> ")
+    for txt in male:
+        eq(B.infer_gender(txt), "male", f"{txt!r} -> ")
+
+def t_gender_default_when_ambiguous():
+    eq(B.infer_gender("The house was empty. Nobody came home."), "male",
+       "ambiguous text should fall back to the default: ")
+
+def t_describe_narrator_matches_gender():
+    true("woman" in B.describe_narrator("female").lower(), "female description")
+    true("man" in B.describe_narrator("male").lower(), "male description")
+
+def t_daughters_story_reads_male():
+    """The sacrificial-father story must not be voiced by a woman on screen."""
+    text = ("I Raised My Daughters Alone For 15 Years. I was the only father "
+            "who also showed up as the mother. Goodnight Dad, they said.")
+    eq(B.infer_gender(text), "male")
 
 def t_cover_centres_crop():
     src = Image.new("RGB", (2000, 500), (10, 10, 10))
@@ -523,10 +556,16 @@ def main():
             ("handles narration before any scene", t_parse_narration_before_scene),
             ("ignores blank lines", t_parse_blank_lines_ignored),
             ("rejects a script with no narration", t_parse_empty_script_rejected),
-            ("reads the character directive", t_parse_character_directive),
-            ("carries a character between scenes", t_character_carries_between_scenes),
-            ("copes with no character at all", t_no_character_directive_is_fine),
             ("every shipped script parses", t_parse_real_scripts),
+        ]),
+        ("narrator", [
+            ("an explicit @ narrator wins", t_explicit_narrator_wins),
+            ("only the first @ line counts", t_first_narrator_line_wins),
+            ("a narrator is inferred when absent", t_narrator_inferred_when_absent),
+            ("gender is inferred from the text", t_gender_inference),
+            ("gender defaults when ambiguous", t_gender_default_when_ambiguous),
+            ("the description matches the gender", t_describe_narrator_matches_gender),
+            ("the daughters story reads male", t_daughters_story_reads_male),
         ]),
         ("word grouping", [
             ("respects the words-per-card limit", t_group_respects_word_limit),

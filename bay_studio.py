@@ -62,29 +62,29 @@ def load_font(size):
 # ── script parsing ────────────────────────────────────────────────────
 def parse_script(path):
     """
-    -> (title, [ {image, character, narration}, ... ])
+    -> (title, narrator, [ {image, narration}, ... ])
 
-    `#` title, `##` the scene's backdrop, `@` who stands on the left for that
-    scene, everything else narration. A scene with no `@` keeps whoever was
-    on screen before it, so a recurring narrator is written once.
+    `#` title, `##` the scene's backdrop, `@` the narrator who appears on the
+    left for the WHOLE video, everything else narration. One narrator tells the
+    whole story, the way a host does — the same face throughout, not a new
+    person each scene. Write `@` once to describe them; leave it out and a
+    narrator is chosen to fit the story (see `describe_narrator`).
     """
-    title, scenes, cur = "Bay Stories", [], None
+    title, narrator, scenes, cur = "Bay Stories", "", [], None
     with open(path, encoding="utf-8") as fh:
         for raw in fh:
             s = raw.strip()
             if s.startswith("##"):
-                cur = dict(image=s[2:].strip(), character="", narration="")
+                cur = dict(image=s[2:].strip(), narration="")
                 scenes.append(cur)
             elif s.startswith("#"):
                 title = s[1:].strip()
             elif s.startswith("@"):
-                if cur is None:
-                    cur = dict(image="", character="", narration="")
-                    scenes.append(cur)
-                cur["character"] = s[1:].strip()
+                if not narrator:                      # first @ wins; one host
+                    narrator = s[1:].strip()
             elif s:
                 if cur is None:                       # narration before any ##
-                    cur = dict(image="", character="", narration="")
+                    cur = dict(image="", narration="")
                     scenes.append(cur)
                 cur["narration"] = (cur["narration"] + " " + s).strip()
 
@@ -92,16 +92,56 @@ def parse_script(path):
     if not scenes:
         raise SystemExit("script has no narration")
 
-    carried = ""
     for s in scenes:
         if not s["image"]:                            # sensible default plate
             s["image"] = ("cinematic emotional film still, natural light, "
                           "shallow depth of field, 4k")
-        if s["character"]:
-            carried = s["character"]
-        else:
-            s["character"] = carried                  # hold the previous face
-    return title, scenes
+
+    if not narrator:
+        body = title + " " + " ".join(s["narration"] for s in scenes)
+        narrator = describe_narrator(infer_gender(body))
+    return title, narrator, scenes
+
+# ── who the narrator is ───────────────────────────────────────────────
+# Whole phrases, not loose words: "wife" alone tells you nothing about the
+# speaker, but "my wife" means the speaker is telling it from a husband's side.
+_MALE_CUES = [
+    "my wife", "as a father", "i am a father", "i'm a father", "single father",
+    "single dad", "as a husband", "as a man", "i am a man", "i'm a man",
+    "called me dad", "called me daddy", "call me dad", "their father",
+    "as their dad", "being a dad", "a father of", "widower",
+]
+_FEMALE_CUES = [
+    "my husband", "as a mother", "i am a mother", "i'm a mother", "single mother",
+    "single mom", "as a wife", "as a woman", "i am a woman", "i'm a woman",
+    "called me mom", "called me mommy", "call me mom", "their mother",
+    "as their mom", "being a mom", "a mother of", "widow", "pregnant",
+    "gave birth", "my pregnancy",
+]
+
+def infer_gender(text):
+    """
+    Guess the narrator's gender from how they refer to themselves.
+
+    Leans on first-person relationship phrases ("my wife", "as a mother"),
+    which pin the speaker's side of a relationship. When a story gives no such
+    cue it returns "male" as a neutral default — override it with an explicit
+    `@` line, which always wins because it never reaches this function.
+    """
+    t = " " + text.lower() + " "
+    male   = sum(t.count(c) for c in _MALE_CUES)
+    female = sum(t.count(c) for c in _FEMALE_CUES)
+    if female > male:
+        return "female"
+    return "male"
+
+def describe_narrator(gender):
+    """A neutral, believable host for the given gender."""
+    if gender == "female":
+        return ("a woman in her late thirties, simple elegant blouse, warm "
+                "composed thoughtful expression, natural makeup")
+    return ("a man in his late thirties, simple collared shirt, calm weathered "
+            "thoughtful expression")
 
 # ── image plates ──────────────────────────────────────────────────────
 STYLE = ("cinematic film still, photorealistic, natural lighting, "
@@ -168,36 +208,42 @@ def fetch_character(prompt, path, seed):
             print(f"    retry: {e}")
     return None
 
-def chroma_key(img, soft=18, hard=42):
+def chroma_key(img, soft=0.10, hard=0.24):
     """
     Key a green screen out of a portrait.
 
-    Works on how far the green channel runs ahead of red and blue, not on
-    absolute colour, so it survives the uneven lighting and off-brand greens
-    that image generators produce. Skin, hair and white clothing all have
-    green sitting level with the other channels, so they stay put.
+    Greenness is measured as a FRACTION of the pixel's own brightness, not as
+    an absolute channel gap. That matters because the backdrop is not evenly
+    lit: a shadowed corner of the screen has a small absolute green lead but is
+    still obviously green, and an absolute threshold leaves it behind as a
+    murky ghost. A ratio keys the bright screen and its shadows alike, while
+    skin, hair and white clothing — where green sits level with red and blue —
+    stay put.
     """
     img = img.convert("RGB")
     a   = np.array(img).astype(np.int16)
     r, g, b = a[:, :, 0], a[:, :, 1], a[:, :, 2]
 
-    dominance = g - np.maximum(r, b)
-    # below `soft` keep fully, above `hard` drop fully, ramp between
-    alpha = 1.0 - np.clip((dominance - soft) / float(hard - soft), 0, 1)
+    bright   = np.maximum(a.max(axis=2), 1)
+    greenness = (g - np.maximum(r, b)) / bright          # 0..1, shadow-proof
+    alpha = 1.0 - np.clip((greenness - soft) / (hard - soft), 0, 1)
 
     # Despill: green light bounces onto hair and shoulders, leaving a green
     # rim that betrays the cut. On every kept pixel, hold green no higher than
     # its neighbours — a real subject has no pixel where green runs ahead.
-    keep  = alpha > 0
+    keep    = alpha > 0
     ceiling = np.maximum(r, b)
     a[:, :, 1] = np.where(keep & (g > ceiling), ceiling, g)
 
-    am = Image.fromarray((alpha * 255).astype(np.uint8))
-    am = am.filter(ImageFilter.MinFilter(3))          # bite off the last fringe
-    am = am.filter(ImageFilter.GaussianBlur(1.2))     # soften the edge
+    am = np.array(Image.fromarray((alpha * 255).astype(np.uint8))
+                  .filter(ImageFilter.MinFilter(3))       # bite off the fringe
+                  .filter(ImageFilter.GaussianBlur(1.2))) # soften the edge
+    # Anything left faint is green haze, not subject — cut it rather than let
+    # it composite as a translucent ghost.
+    am[am < 40] = 0
 
     out = Image.fromarray(a.astype(np.uint8)).convert("RGBA")
-    out.putalpha(am)
+    out.putalpha(Image.fromarray(am))
     return out
 
 def largest_blob(img):
@@ -547,13 +593,14 @@ def build(script_path, out_path, work=None, keep_plates=False):
     import imageio_ffmpeg
     FFMPEG = imageio_ffmpeg.get_ffmpeg_exe()
 
-    title, scenes = parse_script(script_path)
+    title, narrator, scenes = parse_script(script_path)
     run = random.randint(1, 10**6)
     work = work or os.path.join(HERE, "out", str(run))
     os.makedirs(work, exist_ok=True)
 
     print(f"▶ {title}")
-    print(f"  {len(scenes)} scenes · seed {run}\n")
+    print(f"  {len(scenes)} scenes · seed {run}")
+    print(f"  narrator: {narrator}\n")
 
     print("── voice ──")
     for i, sc in enumerate(scenes):
@@ -574,31 +621,22 @@ def build(script_path, out_path, work=None, keep_plates=False):
                        else Image.new("RGB", (W, H), (20, 18, 16)))
         print(f"   {i+1}. {'ok' if p else 'FALLBACK'}  {sc['image'][:56]}")
 
-    print("\n── characters ──")
-    cast = {}                                   # prompt -> prepared cutout
-    for i, sc in enumerate(scenes):
-        want = sc["character"]
-        if not want:
-            sc["cast"] = None
-            print(f"   {i+1}. (none)")
-            continue
-        if want not in cast:
-            path = os.path.join(work, f"char_{len(cast)}.jpg")
-            got  = fetch_character(want, path, random.randint(1, 10**6))
-            cast[want] = prepare_character(got) if got else None
-            print(f"   {i+1}. {'cut' if cast[want] else 'FAILED'}  {want[:52]}")
-        else:
-            print(f"   {i+1}. reuse  {want[:52]}")
-        sc["cast"] = cast[want]
+    print("\n── narrator ──")
+    # One narrator for the whole video: generate and cut them once, then reuse
+    # the exact same cutout on every scene so the face never changes.
+    char_path = fetch_character(narrator, os.path.join(work, "narrator.jpg"),
+                                random.randint(1, 10**6))
+    narrator_cut = prepare_character(char_path) if char_path else None
+    print(f"   {'cut ' + str(narrator_cut.size) if narrator_cut else 'FAILED — playing full-bleed'}")
 
     print("\n── render ──")
     FADE, parts = 0.35, []
     for i, sc in enumerate(scenes):
-        dur, windows, plate, cast = sc["dur"], sc["windows"], sc["plate"], sc["cast"]
+        dur, windows, plate = sc["dur"], sc["windows"], sc["plate"]
 
-        def make(t, dur=dur, windows=windows, plate=plate, cast=cast):
+        def make(t, dur=dur, windows=windows, plate=plate):
             fade = min(1.0, t / FADE, (dur - t) / FADE)
-            return compose(plate, windows, t, dur, fade, cast)
+            return compose(plate, windows, t, dur, fade, narrator_cut)
 
         clip = VideoClip(make, duration=dur).with_audio(AudioFileClip(sc["mp3"]))
         part = os.path.join(work, f"scene_{i}.mp4")

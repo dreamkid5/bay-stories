@@ -20,9 +20,10 @@ permissions:
 jobs:
   render:
     runs-on: ubuntu-latest
-    # Image generation and TTS are network calls; give them room but don't
-    # let a wedged run burn the whole quota.
-    timeout-minutes: 90
+    # Long-form videos render many scenes back to back. GitHub allows a job up
+    # to 6 hours; this ceiling stops a wedged run short of that while still
+    # leaving room for a feature-length render.
+    timeout-minutes: 330
 
     steps:
       - uses: actions/checkout@v4
