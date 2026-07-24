@@ -1,0 +1,109 @@
+name: Render story
+
+# Push a script to scripts/ and GitHub renders the video for you.
+# You can also trigger a run by hand from the Actions tab.
+on:
+  push:
+    paths:
+      - "scripts/**.txt"
+  workflow_dispatch:
+    inputs:
+      script:
+        description: "Script to render (e.g. scripts/my-story.txt). Blank = every script."
+        required: false
+        default: ""
+
+# gh release create needs to write to the repo
+permissions:
+  contents: write
+
+jobs:
+  render:
+    runs-on: ubuntu-latest
+    # Image generation and TTS are network calls; give them room but don't
+    # let a wedged run burn the whole quota.
+    timeout-minutes: 90
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 2          # need the previous commit to diff against
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install ffmpeg
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq ffmpeg
+
+      - name: Install Python dependencies
+        run: pip install -r requirements.txt
+
+      - name: Work out which scripts to render
+        id: pick
+        run: |
+          set -euo pipefail
+          if [ -n "${{ github.event.inputs.script }}" ]; then
+            # Manual run naming a single script
+            targets="${{ github.event.inputs.script }}"
+          elif [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            # Manual run with no script named: do them all
+            targets="$(ls scripts/*.txt 2>/dev/null || true)"
+          else
+            # Push: only what actually changed in this push
+            targets="$(git diff --name-only --diff-filter=ACM \
+                        "${{ github.event.before }}" "${{ github.sha }}" \
+                        -- 'scripts/*.txt' 2>/dev/null || true)"
+            # First push on a branch has no usable "before" commit
+            if [ -z "$targets" ]; then
+              targets="$(ls scripts/*.txt 2>/dev/null || true)"
+            fi
+          fi
+
+          if [ -z "$targets" ]; then
+            echo "No scripts to render."
+            echo "found=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "Rendering:"; echo "$targets" | sed 's/^/  /'
+            echo "found=true" >> "$GITHUB_OUTPUT"
+            { echo "targets<<EOF"; echo "$targets"; echo "EOF"; } >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Render
+        if: steps.pick.outputs.found == 'true'
+        run: |
+          set -euo pipefail
+          mkdir -p videos
+          while IFS= read -r script; do
+            [ -z "$script" ] && continue
+            [ -f "$script" ] || { echo "::warning::missing $script"; continue; }
+            name="$(basename "${script%.txt}")"
+            echo "::group::$name"
+            python bay_studio.py --script "$script" --out "videos/${name}.mp4"
+            echo "::endgroup::"
+          done <<< "${{ steps.pick.outputs.targets }}"
+          ls -lh videos/
+
+      - name: Upload videos
+        if: steps.pick.outputs.found == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: videos-${{ github.run_number }}
+          path: videos/*.mp4
+          retention-days: 30
+          if-no-files-found: error
+
+      # A release gives every video a permanent download link, so you don't
+      # have to dig through Actions runs to find one.
+      - name: Publish release
+        if: steps.pick.outputs.found == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tag="render-${{ github.run_number }}"
+          gh release create "$tag" videos/*.mp4 \
+            --title "Videos · run ${{ github.run_number }}" \
+            --notes "Rendered from \`${{ github.ref_name }}\` @ \`${{ github.sha }}\`."
