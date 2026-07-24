@@ -7,13 +7,20 @@ Push a script → GitHub renders the video → download it from the release.
 
 ## Writing a script
 
-A script is a plain text file. `#` is the title, `##` starts a new scene and
-describes the picture for it, and the lines underneath are what gets narrated.
+A script is a plain text file with four kinds of line:
+
+| Line | Meaning |
+|---|---|
+| `#` | The title |
+| `##` | The backdrop for this scene |
+| `@` | Who stands on the left for this scene |
+| anything else | The narration |
 
 ```
 # I Raised My Daughters Alone For 15 Years
 
 ## a man sitting alone on a couch late at night, one warm lamp, melancholy
+@ a weary father in his forties, plain shirt, quiet sadness
 Fifteen years. That is how long I gave everything I had. No partner. No help.
 
 ## a tired father in a diner kitchen at night, worn uniform
@@ -26,6 +33,26 @@ sentences cut better than long ones.
 The `##` line is an image prompt. Describe the shot, not the story: who is in
 frame, where they are, what the light is doing. Cinematic styling is added for
 you, so there's no need to write "4k, cinematic, photorealistic".
+
+### Characters
+
+The `@` line puts a cut-out figure on the left of the frame, and captions move
+over to sit beside them. Describe the person — age, clothing, expression.
+
+A scene with no `@` keeps whoever was on screen before it, so a narrator who
+stays for the whole story is written once at the top. Give a scene a new `@`
+whenever the story turns to someone else, and the face changes with it. Repeat
+an earlier description word for word and that same figure comes back — the
+generated image is reused rather than made again.
+
+Leave `@` out of a script entirely and the video plays full-bleed with no
+figure at all.
+
+Characters are generated against a green screen and keyed out. A white studio
+backdrop looks tidier but cannot be cut reliably: a white shirt against a white
+wall is genuinely ambiguous, and the clothes get erased along with the wall.
+Nothing on a person is green, which is why the technique has survived in
+broadcast for seventy years.
 
 ## Rendering on GitHub
 

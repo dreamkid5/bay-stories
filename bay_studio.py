@@ -43,6 +43,7 @@ CAP_Y        = 0.585                 # caption baseline, fraction of height
 WORDS_PER_LINE = 4                   # words visible at once
 HILITE       = (124, 42, 232)        # pill behind the spoken word
 STROKE       = 9                     # black outline thickness
+CHAR_BAND    = 0.34                  # width of the frame the character may use
 
 FONT_CANDIDATES = [
     os.path.join(HERE, "fonts", "Poppins-ExtraBold.ttf"),   # shipped in this repo
@@ -60,29 +61,46 @@ def load_font(size):
 
 # ── script parsing ────────────────────────────────────────────────────
 def parse_script(path):
-    """-> (title, [ {image, narration}, ... ])"""
+    """
+    -> (title, [ {image, character, narration}, ... ])
+
+    `#` title, `##` the scene's backdrop, `@` who stands on the left for that
+    scene, everything else narration. A scene with no `@` keeps whoever was
+    on screen before it, so a recurring narrator is written once.
+    """
     title, scenes, cur = "Bay Stories", [], None
     with open(path, encoding="utf-8") as fh:
         for raw in fh:
-            line = raw.rstrip("\n")
-            s = line.strip()
+            s = raw.strip()
             if s.startswith("##"):
-                cur = dict(image=s[2:].strip(), narration="")
+                cur = dict(image=s[2:].strip(), character="", narration="")
                 scenes.append(cur)
             elif s.startswith("#"):
                 title = s[1:].strip()
+            elif s.startswith("@"):
+                if cur is None:
+                    cur = dict(image="", character="", narration="")
+                    scenes.append(cur)
+                cur["character"] = s[1:].strip()
             elif s:
                 if cur is None:                       # narration before any ##
-                    cur = dict(image="", narration="")
+                    cur = dict(image="", character="", narration="")
                     scenes.append(cur)
                 cur["narration"] = (cur["narration"] + " " + s).strip()
+
     scenes = [s for s in scenes if s["narration"]]
     if not scenes:
         raise SystemExit("script has no narration")
+
+    carried = ""
     for s in scenes:
         if not s["image"]:                            # sensible default plate
             s["image"] = ("cinematic emotional film still, natural light, "
                           "shallow depth of field, 4k")
+        if s["character"]:
+            carried = s["character"]
+        else:
+            s["character"] = carried                  # hold the previous face
     return title, scenes
 
 # ── image plates ──────────────────────────────────────────────────────
@@ -114,6 +132,206 @@ def cover(img):
     img = img.resize((nw, nh), Image.LANCZOS)
     return img.crop(((nw - W) // 2, (nh - H) // 2,
                      (nw - W) // 2 + W, (nh - H) // 2 + H))
+
+def fit(img, max_w, max_h):
+    """
+    Scale to fit inside a box. One scale factor for both axes — the whole
+    point is that a portrait can never come out stretched or squashed.
+    """
+    scale = min(max_w / img.width, max_h / img.height)
+    return img.resize((max(1, round(img.width * scale)),
+                       max(1, round(img.height * scale))), Image.LANCZOS)
+
+# The character is generated against a green screen and keyed out. A white
+# studio backdrop seems tidier but cannot be separated reliably: a white shirt
+# on a white wall is genuinely ambiguous to any colour-matching cutout, and the
+# clothes get eaten along with the background. Nothing on a person is green.
+CHAR_STYLE = ("full body shot, standing, facing camera, whole figure visible "
+              "with empty space on both sides, solid chroma key green screen "
+              "background, bright even studio lighting, photorealistic, "
+              "sharp focus, 8k, no text, no watermark")
+
+def fetch_character(prompt, path, seed):
+    if os.path.exists(path) and os.path.getsize(path) > 5000:
+        return path
+    full = f"{prompt}, {CHAR_STYLE}"
+    url = (f"https://image.pollinations.ai/prompt/{urllib.parse.quote(full)}"
+           f"?width=576&height=864&model=flux&nologo=true&seed={seed}")
+    for _ in range(3):
+        try:
+            req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+            data = urllib.request.urlopen(req, timeout=90).read()
+            if len(data) > 5000:
+                open(path, "wb").write(data)
+                return path
+        except Exception as e:
+            print(f"    retry: {e}")
+    return None
+
+def chroma_key(img, soft=18, hard=42):
+    """
+    Key a green screen out of a portrait.
+
+    Works on how far the green channel runs ahead of red and blue, not on
+    absolute colour, so it survives the uneven lighting and off-brand greens
+    that image generators produce. Skin, hair and white clothing all have
+    green sitting level with the other channels, so they stay put.
+    """
+    img = img.convert("RGB")
+    a   = np.array(img).astype(np.int16)
+    r, g, b = a[:, :, 0], a[:, :, 1], a[:, :, 2]
+
+    dominance = g - np.maximum(r, b)
+    # below `soft` keep fully, above `hard` drop fully, ramp between
+    alpha = 1.0 - np.clip((dominance - soft) / float(hard - soft), 0, 1)
+
+    # Despill: green light bounces onto hair and shoulders, leaving a green
+    # rim that betrays the cut. On every kept pixel, hold green no higher than
+    # its neighbours — a real subject has no pixel where green runs ahead.
+    keep  = alpha > 0
+    ceiling = np.maximum(r, b)
+    a[:, :, 1] = np.where(keep & (g > ceiling), ceiling, g)
+
+    am = Image.fromarray((alpha * 255).astype(np.uint8))
+    am = am.filter(ImageFilter.MinFilter(3))          # bite off the last fringe
+    am = am.filter(ImageFilter.GaussianBlur(1.2))     # soften the edge
+
+    out = Image.fromarray(a.astype(np.uint8)).convert("RGBA")
+    out.putalpha(am)
+    return out
+
+def largest_blob(img):
+    """
+    Keep only the biggest connected piece of the cutout.
+
+    Keying leaves specks where the backdrop was mottled. The subject is always
+    the largest connected region, so everything else is noise.
+    """
+    from collections import deque
+    alpha = np.array(img.getchannel("A"))
+    solid = alpha > 40
+    h, w = solid.shape
+    if not solid.any():
+        return img
+
+    seen = np.zeros_like(solid)
+    best, best_size = None, 0
+    for sy in range(0, h, 4):                     # coarse seeding is plenty
+        for sx in range(0, w, 4):
+            if not solid[sy, sx] or seen[sy, sx]:
+                continue
+            q = deque([(sy, sx)]); seen[sy, sx] = True
+            blob, size = [], 0
+            while q:
+                y, x = q.popleft()
+                blob.append((y, x)); size += 1
+                for dy, dx in ((1, 0), (-1, 0), (0, 1), (0, -1)):
+                    ny, nx = y + dy, x + dx
+                    if 0 <= ny < h and 0 <= nx < w and solid[ny, nx] and not seen[ny, nx]:
+                        seen[ny, nx] = True
+                        q.append((ny, nx))
+            if size > best_size:
+                best, best_size = blob, size
+
+    if best is None:
+        return img
+    keep = np.zeros_like(solid)
+    for y, x in best:
+        keep[y, x] = True
+    out = np.array(img)
+    out[:, :, 3] = np.where(keep, out[:, :, 3], 0)
+    return Image.fromarray(out)
+
+def prepare_character(path):
+    """Key the figure out and size it for the left of the frame."""
+    if not path or not os.path.exists(path):
+        return None
+    cut = largest_blob(chroma_key(Image.open(path)))
+
+    # Trim to what actually survived, so sizing is driven by the person and
+    # not by empty margin that used to be backdrop.
+    bbox = cut.getbbox()
+    if bbox:
+        cut = cut.crop(bbox)
+
+    # Stand the figure full-height. Sizing on width instead would leave a
+    # waist-up portrait stranded in the bottom half of the frame.
+    target_h = int(H * 0.97)
+    scale    = target_h / cut.height
+    cut = cut.resize((max(1, round(cut.width * scale)), target_h), Image.LANCZOS)
+
+    # A waist-up shot comes out near-square and would swallow half the frame.
+    # Crop the sides to the character band, keeping the subject's own centre
+    # of mass in view — the same call a camera operator makes framing a guest.
+    band = int(W * CHAR_BAND)
+    if cut.width > band:
+        alpha = np.array(cut.getchannel("A")) > 40
+        cols  = np.where(alpha.any(axis=0))[0]
+        centre = int(cols.mean()) if len(cols) else cut.width // 2
+        left   = int(np.clip(centre - band // 2, 0, cut.width - band))
+        cut = cut.crop((left, 0, left + band, cut.height))
+
+        # If the crop sliced through the figure it leaves a hard vertical
+        # edge, which reads as a torn photograph. Fade the cut side out.
+        arr  = np.array(cut).astype(np.float32)
+        ramp = int(band * 0.10)
+        arr[:, -ramp:, 3] *= np.linspace(1, 0, ramp)[None, :]
+        cut  = Image.fromarray(arr.astype(np.uint8))
+    return cut
+
+# ── cutting the character out of its backdrop ─────────────────────────
+def remove_backdrop(img, tol=30, feather=2):
+    """
+    Drop the studio backdrop behind a portrait, keeping the person.
+
+    Background is what is BOTH close to the border colour and reachable from
+    the border. Two conditions, because either alone fails: matching colour
+    only would punch holes through anything in the subject that happens to be
+    pale, while a plain flood fill walks the backdrop's own soft gradient
+    straight into the person's face.
+    """
+    from collections import deque
+    img = img.convert("RGB")
+    a   = np.array(img).astype(np.int16)
+    h, w = a.shape[:2]
+
+    ring = np.concatenate([
+        a[:6].reshape(-1, 3), a[-6:].reshape(-1, 3),
+        a[:, :6].reshape(-1, 3), a[:, -6:].reshape(-1, 3),
+    ])
+    ref       = np.median(ring, axis=0)
+    in_band   = np.abs(a - ref).max(axis=2) <= tol * 3   # generous global band
+    local_tol = max(6, tol // 3)                          # tight local step
+
+    seen = np.zeros((h, w), dtype=bool)
+    q = deque()
+    for x in range(w):
+        for y in (0, h - 1):
+            if in_band[y, x] and not seen[y, x]:
+                seen[y, x] = True; q.append((y, x))
+    for y in range(h):
+        for x in (0, w - 1):
+            if in_band[y, x] and not seen[y, x]:
+                seen[y, x] = True; q.append((y, x))
+
+    while q:
+        y, x = q.popleft()
+        c = a[y, x]
+        for dy, dx in ((1, 0), (-1, 0), (0, 1), (0, -1)):
+            ny, nx = y + dy, x + dx
+            if (0 <= ny < h and 0 <= nx < w and not seen[ny, nx]
+                    and in_band[ny, nx]
+                    and np.abs(a[ny, nx] - c).max() <= local_tol):
+                seen[ny, nx] = True
+                q.append((ny, nx))
+
+    alpha = np.where(seen, 0, 255).astype(np.uint8)
+    am = Image.fromarray(alpha).filter(ImageFilter.MinFilter(3))  # eat the fringe
+    am = am.filter(ImageFilter.GaussianBlur(feather))             # soften the edge
+
+    out = img.convert("RGBA")
+    out.putalpha(am)
+    return out
 
 # ── output integrity ──────────────────────────────────────────────────
 def verify_video(path, expect_audio=True, min_seconds=0.5):
@@ -222,27 +440,36 @@ def card_windows(cards, dur):
 # ── caption drawing ───────────────────────────────────────────────────
 _font = load_font(CAP_SIZE)
 
-def draw_caption(frame, card, t):
-    """Draw one caption card, pill-highlighting the word being spoken."""
+def draw_caption(frame, card, t, band_left=0):
+    """
+    Draw one caption card, pill-highlighting the word being spoken.
+
+    `band_left` is where the usable width starts. When a character stands on
+    the left, captions centre in the space beside them instead of the whole
+    frame, so text never lands on top of the figure.
+    """
     d = ImageDraw.Draw(frame)
     words = [w[2].upper().strip() for w in card]
     # Word gap must clear the pill padding plus the outline on both sides,
     # or a neighbour's stroke eats into the highlight.
     gap   = 40
 
+    band_w = W - band_left
+    max_w  = band_w * 0.90
+
     widths = [d.textlength(w, font=_font) for w in words]
     total  = sum(widths) + gap * (len(words) - 1)
 
     # shrink to fit if a card runs wide
     fnt, scale = _font, 1.0
-    if total > W * 0.88:
-        scale = (W * 0.88) / total
-        fnt   = load_font(max(28, int(CAP_SIZE * scale)))
+    if total > max_w:
+        scale = max_w / total
+        fnt   = load_font(max(24, int(CAP_SIZE * scale)))
         widths = [d.textlength(w, font=fnt) for w in words]
-        gap    = int(gap * scale)
+        gap    = max(12, int(gap * scale))
         total  = sum(widths) + gap * (len(words) - 1)
 
-    x = (W - total) / 2
+    x = band_left + (band_w - total) / 2
     y = H * CAP_Y
 
     # Pill bounds come from the actual cap-height of the drawn glyphs, not the
@@ -276,7 +503,7 @@ def ken_burns(plate, t, dur):
     oy = int((H - ch) * (0.5 + 0.16 * np.cos(t * 0.10)))
     return plate.crop((ox, oy, ox + cw, oy + ch)).resize((W, H), Image.LANCZOS)
 
-def compose(plate, windows, t, dur, fade):
+def compose(plate, windows, t, dur, fade, character=None):
     frame = ken_burns(plate, t, dur).convert("RGBA")
 
     # gentle top/bottom falloff — keeps captions legible on bright plates
@@ -287,9 +514,26 @@ def compose(plate, windows, t, dur, fade):
     a[:, :, :3] *= ramp[:, None, None]
     frame = Image.fromarray(np.clip(a, 0, 255).astype(np.uint8))
 
+    band_left = 0
+    if character is not None:
+        # Soften the plate behind the figure so a cut edge doesn't read as a
+        # sticker pasted onto a busy photograph.
+        scrim = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+        sd = ImageDraw.Draw(scrim)
+        reach = int(character.width * 1.12)
+        for i in range(reach):
+            sd.line([(i, 0), (i, H)],
+                    fill=(8, 9, 14, int(120 * (1 - i / reach) ** 1.5)))
+        frame.alpha_composite(scrim)
+
+        # Bottom-anchored: the frame edge crops the figure, the way a real
+        # lower-third does. No fade — that reads as a dissolve, not a cutout.
+        frame.alpha_composite(character, (0, H - character.height))
+        band_left = int(character.width * 0.92)
+
     for start, end, card in windows:
         if start <= t < end:
-            draw_caption(frame, card, t)
+            draw_caption(frame, card, t, band_left)
             break
 
     out = np.array(frame.convert("RGB"))
@@ -330,14 +574,31 @@ def build(script_path, out_path, work=None, keep_plates=False):
                        else Image.new("RGB", (W, H), (20, 18, 16)))
         print(f"   {i+1}. {'ok' if p else 'FALLBACK'}  {sc['image'][:56]}")
 
+    print("\n── characters ──")
+    cast = {}                                   # prompt -> prepared cutout
+    for i, sc in enumerate(scenes):
+        want = sc["character"]
+        if not want:
+            sc["cast"] = None
+            print(f"   {i+1}. (none)")
+            continue
+        if want not in cast:
+            path = os.path.join(work, f"char_{len(cast)}.jpg")
+            got  = fetch_character(want, path, random.randint(1, 10**6))
+            cast[want] = prepare_character(got) if got else None
+            print(f"   {i+1}. {'cut' if cast[want] else 'FAILED'}  {want[:52]}")
+        else:
+            print(f"   {i+1}. reuse  {want[:52]}")
+        sc["cast"] = cast[want]
+
     print("\n── render ──")
     FADE, parts = 0.35, []
     for i, sc in enumerate(scenes):
-        dur, windows, plate = sc["dur"], sc["windows"], sc["plate"]
+        dur, windows, plate, cast = sc["dur"], sc["windows"], sc["plate"], sc["cast"]
 
-        def make(t, dur=dur, windows=windows, plate=plate):
+        def make(t, dur=dur, windows=windows, plate=plate, cast=cast):
             fade = min(1.0, t / FADE, (dur - t) / FADE)
-            return compose(plate, windows, t, dur, fade)
+            return compose(plate, windows, t, dur, fade, cast)
 
         clip = VideoClip(make, duration=dur).with_audio(AudioFileClip(sc["mp3"]))
         part = os.path.join(work, f"scene_{i}.mp4")

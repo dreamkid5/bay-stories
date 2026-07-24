@@ -217,6 +217,132 @@ def t_cover_does_not_squeeze():
     true(abs(width - expected_w) <= 5,
          f"width {width}px, expected about {expected_w:.0f}px — image was scaled non-uniformly")
 
+def t_fit_preserves_aspect():
+    """The guard against a squeezed character: one scale factor, both axes."""
+    for size in [(400, 900), (900, 400), (512, 768), (1000, 1000), (137, 641)]:
+        out = B.fit(Image.new("RGBA", size), 435, 700)
+        before = size[0] / size[1]
+        after  = out.width / out.height
+        true(abs(before - after) / before < 0.02,
+             f"fit{size} -> {out.size}: aspect changed {before:.3f} to {after:.3f}")
+
+def t_fit_stays_inside_box():
+    for size in [(400, 900), (900, 400), (2000, 30)]:
+        out = B.fit(Image.new("RGBA", size), 435, 700)
+        true(out.width <= 435 and out.height <= 700,
+             f"fit{size} -> {out.size} escaped the box")
+
+def t_chroma_key_removes_green_keeps_subject():
+    img = Image.new("RGB", (200, 200), (28, 190, 42))          # green screen
+    from PIL import ImageDraw
+    ImageDraw.Draw(img).rectangle([60, 60, 140, 140], fill=(232, 200, 178))  # skin
+    a = np.array(B.chroma_key(img).getchannel("A"))
+    true(a[10, 10] < 30, "green backdrop was not keyed out")
+    true(a[100, 100] > 200, "the subject was keyed out along with the backdrop")
+
+def t_chroma_key_keeps_white_clothing():
+    """
+    White on white is what broke the earlier cutout; on green it must survive.
+    """
+    img = Image.new("RGB", (200, 200), (30, 185, 45))
+    from PIL import ImageDraw
+    ImageDraw.Draw(img).rectangle([70, 70, 130, 130], fill=(248, 248, 246))
+    a = np.array(B.chroma_key(img).getchannel("A"))
+    true(a[100, 100] > 200, "white clothing was keyed out")
+
+def t_chroma_key_despills():
+    """No kept pixel may still have green running ahead of red and blue."""
+    img = Image.new("RGB", (120, 120), (30, 185, 45))
+    from PIL import ImageDraw
+    ImageDraw.Draw(img).rectangle([40, 40, 80, 80], fill=(180, 205, 170))  # green-lit skin
+    out = np.array(B.chroma_key(img))
+    kept = out[:, :, 3] > 128
+    if kept.any():
+        r, g, b = out[:, :, 0].astype(int), out[:, :, 1].astype(int), out[:, :, 2].astype(int)
+        over = kept & (g > np.maximum(r, b) + 1)
+        true(not over.any(), f"{over.sum()} kept pixels still carry green spill")
+
+def t_largest_blob_drops_specks():
+    img = Image.new("RGBA", (100, 100), (0, 0, 0, 0))
+    from PIL import ImageDraw
+    d = ImageDraw.Draw(img)
+    d.rectangle([20, 20, 70, 80], fill=(200, 180, 160, 255))   # the subject
+    d.rectangle([90, 5, 95, 10],  fill=(200, 180, 160, 255))   # a speck
+    out = np.array(B.largest_blob(img).getchannel("A"))
+    true(out[50, 40] > 200, "the subject was dropped")
+    true(out[7, 92] < 30, "a stray speck survived")
+
+def t_character_fits_its_band():
+    img = Image.new("RGB", (512, 768), (30, 185, 45))
+    from PIL import ImageDraw
+    ImageDraw.Draw(img).ellipse([180, 120, 330, 700], fill=(210, 180, 150))
+    import tempfile as _tf
+    p = os.path.join(_tf.mkdtemp(), "c.jpg")
+    img.save(p)
+    ch = B.prepare_character(p)
+    true(ch is not None, "no character produced")
+    true(ch.width <= int(B.W * B.CHAR_BAND) + 1,
+         f"character is {ch.width}px wide, band allows {int(B.W * B.CHAR_BAND)}px")
+    true(ch.height <= B.H, f"character is {ch.height}px tall, frame is {B.H}px")
+
+def t_captions_clear_the_character():
+    """Text must never be drawn on top of the figure."""
+    plate = Image.new("RGB", (B.W, B.H), (0, 0, 0))
+    char  = Image.new("RGBA", (400, 700), (255, 0, 0, 255))
+    words = fake_words([("alpha", 0.0, .5), ("bravo", .5, .5), ("charlie", 1.0, .5)])
+    win = B.card_windows(B.group_words(words, "alpha bravo charlie"), 3.0)
+    frame = B.compose(plate, win, 0.2, 3.0, 1.0, char)
+
+    band = int(B.H * B.CAP_Y) - 20, int(B.H * B.CAP_Y) + B.CAP_SIZE + 20
+    strip = frame[band[0]:band[1], :400]
+    # inside the character's columns the caption's white text must not appear
+    whitish = (strip[:, :, 0] > 200) & (strip[:, :, 1] > 200) & (strip[:, :, 2] > 200)
+    true(whitish.sum() < 40,
+         f"{whitish.sum()} caption pixels landed on the character")
+
+def t_compose_without_character_still_works():
+    plate = Image.new("RGB", (B.W, B.H), (60, 60, 60))
+    words = fake_words([("solo", 0.0, .5)])
+    win = B.card_windows(B.group_words(words, "solo."), 2.0)
+    frame = B.compose(plate, win, 0.2, 2.0, 1.0, None)
+    eq(frame.shape, (B.H, B.W, 3))
+
+def t_parse_character_directive():
+    with tempfile.NamedTemporaryFile("w", suffix=".txt", delete=False) as f:
+        f.write("# T\n## a kitchen\n@ a tired woman in her forties\nShe waited.\n")
+        p = f.name
+    try:
+        _, scenes = B.parse_script(p)
+        eq(scenes[0]["character"], "a tired woman in her forties")
+        eq(scenes[0]["narration"], "She waited.")
+    finally:
+        os.unlink(p)
+
+def t_character_carries_between_scenes():
+    """A character written once stays on screen until a new one is named."""
+    with tempfile.NamedTemporaryFile("w", suffix=".txt", delete=False) as f:
+        f.write("# T\n## a\n@ the narrator\nOne.\n## b\nTwo.\n"
+                "## c\n@ a young man\nThree.\n## d\nFour.\n")
+        p = f.name
+    try:
+        _, s = B.parse_script(p)
+        eq(s[0]["character"], "the narrator")
+        eq(s[1]["character"], "the narrator", "scene 2 should hold the previous face: ")
+        eq(s[2]["character"], "a young man")
+        eq(s[3]["character"], "a young man", "scene 4 should hold the previous face: ")
+    finally:
+        os.unlink(p)
+
+def t_no_character_directive_is_fine():
+    with tempfile.NamedTemporaryFile("w", suffix=".txt", delete=False) as f:
+        f.write("# T\n## a room\nNarration only.\n")
+        p = f.name
+    try:
+        _, s = B.parse_script(p)
+        eq(s[0]["character"], "", "expected no character when none is written")
+    finally:
+        os.unlink(p)
+
 def t_cover_centres_crop():
     src = Image.new("RGB", (2000, 500), (10, 10, 10))
     from PIL import ImageDraw
@@ -397,6 +523,9 @@ def main():
             ("handles narration before any scene", t_parse_narration_before_scene),
             ("ignores blank lines", t_parse_blank_lines_ignored),
             ("rejects a script with no narration", t_parse_empty_script_rejected),
+            ("reads the character directive", t_parse_character_directive),
+            ("carries a character between scenes", t_character_carries_between_scenes),
+            ("copes with no character at all", t_no_character_directive_is_fine),
             ("every shipped script parses", t_parse_real_scripts),
         ]),
         ("word grouping", [
@@ -416,6 +545,15 @@ def main():
             ("cover fills the frame exactly", t_cover_exact_size),
             ("cover never squeezes the image", t_cover_does_not_squeeze),
             ("cover crops from the centre", t_cover_centres_crop),
+            ("fit never distorts aspect", t_fit_preserves_aspect),
+            ("fit stays inside its box", t_fit_stays_inside_box),
+        ]),
+        ("character cutout", [
+            ("keys out green, keeps the subject", t_chroma_key_removes_green_keeps_subject),
+            ("keeps white clothing", t_chroma_key_keeps_white_clothing),
+            ("removes green spill", t_chroma_key_despills),
+            ("drops stray specks", t_largest_blob_drops_specks),
+            ("character fits its band", t_character_fits_its_band),
         ]),
         ("frame rendering", [
             ("frame has the right shape and type", t_compose_shape_and_type),
@@ -424,6 +562,8 @@ def main():
             ("fade darkens the frame", t_fade_darkens),
             ("an overlong card stays inside the frame", t_long_card_fits_width),
             ("ken burns keeps the plate moving", t_ken_burns_moves),
+            ("captions clear the character", t_captions_clear_the_character),
+            ("renders fine with no character", t_compose_without_character_still_works),
         ]),
         ("output integrity", [
             ("rejects a missing file", t_verify_rejects_missing),
