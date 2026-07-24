@@ -1,0 +1,464 @@
+#!/usr/bin/env python3
+"""
+Test suite for bay_studio.
+
+    python3 test_bay_studio.py           # fast checks only (no network)
+    python3 test_bay_studio.py --full    # adds a real end-to-end render
+
+The fast pass is pure logic and pixels — no network, no TTS, runs in seconds.
+The full pass renders an actual short video, so it needs network access for
+the voice engine and the image API.
+"""
+import os, subprocess, sys, tempfile, traceback
+import numpy as np
+from PIL import Image
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import bay_studio as B
+
+PASS = FAIL = 0
+FAILURES = []
+
+def check(name, fn):
+    global PASS, FAIL
+    try:
+        fn()
+        PASS += 1
+        print(f"  \033[32mPASS\033[0m  {name}")
+    except Exception as e:
+        FAIL += 1
+        FAILURES.append((name, traceback.format_exc()))
+        print(f"  \033[31mFAIL\033[0m  {name}  →  {e}")
+
+def eq(got, want, what=""):
+    assert got == want, f"{what}expected {want!r}, got {got!r}"
+
+def true(cond, msg):
+    assert cond, msg
+
+# ── script parsing ────────────────────────────────────────────────────
+def t_parse_basic():
+    with tempfile.NamedTemporaryFile("w", suffix=".txt", delete=False) as f:
+        f.write("# My Title\n## a quiet room\nHello world. Second line.\n"
+                "## a busy street\nMore narration here.\n")
+        p = f.name
+    try:
+        title, scenes = B.parse_script(p)
+        eq(title, "My Title", "title: ")
+        eq(len(scenes), 2, "scene count: ")
+        eq(scenes[0]["image"], "a quiet room")
+        eq(scenes[0]["narration"], "Hello world. Second line.")
+        eq(scenes[1]["narration"], "More narration here.")
+    finally:
+        os.unlink(p)
+
+def t_parse_multiline_narration():
+    """Consecutive narration lines join into one block."""
+    with tempfile.NamedTemporaryFile("w", suffix=".txt", delete=False) as f:
+        f.write("# T\n## img\nLine one.\nLine two.\nLine three.\n")
+        p = f.name
+    try:
+        _, scenes = B.parse_script(p)
+        eq(len(scenes), 1)
+        eq(scenes[0]["narration"], "Line one. Line two. Line three.")
+    finally:
+        os.unlink(p)
+
+def t_parse_narration_before_scene():
+    """Narration with no ## above it still yields a scene, with a default plate."""
+    with tempfile.NamedTemporaryFile("w", suffix=".txt", delete=False) as f:
+        f.write("# T\nOrphan narration.\n")
+        p = f.name
+    try:
+        _, scenes = B.parse_script(p)
+        eq(len(scenes), 1)
+        true(scenes[0]["image"], "expected a default image prompt")
+    finally:
+        os.unlink(p)
+
+def t_parse_blank_lines_ignored():
+    with tempfile.NamedTemporaryFile("w", suffix=".txt", delete=False) as f:
+        f.write("# T\n\n\n## img\n\nNarration.\n\n\n")
+        p = f.name
+    try:
+        _, scenes = B.parse_script(p)
+        eq(len(scenes), 1)
+        eq(scenes[0]["narration"], "Narration.")
+    finally:
+        os.unlink(p)
+
+def t_parse_empty_script_rejected():
+    with tempfile.NamedTemporaryFile("w", suffix=".txt", delete=False) as f:
+        f.write("# Title only\n")
+        p = f.name
+    try:
+        try:
+            B.parse_script(p)
+            raise AssertionError("empty script should have been rejected")
+        except SystemExit:
+            pass
+    finally:
+        os.unlink(p)
+
+def t_parse_real_scripts():
+    """Every script shipped in the repo must parse."""
+    d = os.path.join(os.path.dirname(os.path.abspath(__file__)), "scripts")
+    files = [f for f in os.listdir(d) if f.endswith(".txt")] if os.path.isdir(d) else []
+    true(files, "no scripts found to check")
+    for f in files:
+        title, scenes = B.parse_script(os.path.join(d, f))
+        true(title, f"{f}: no title")
+        true(scenes, f"{f}: no scenes")
+        for i, s in enumerate(scenes):
+            true(s["narration"].strip(), f"{f}: scene {i+1} has no narration")
+            true(s["image"].strip(), f"{f}: scene {i+1} has no image prompt")
+
+# ── word grouping ─────────────────────────────────────────────────────
+def fake_words(spec):
+    """[(text, start, dur)] -> the engine's (start, dur, text) tuples."""
+    return [(s, d, txt) for txt, s, d in spec]
+
+def t_group_respects_word_limit():
+    words = fake_words([(f"w{i}", i * 0.5, 0.4) for i in range(12)])
+    cards = B.group_words(words, " ".join(f"w{i}" for i in range(12)))
+    for c in cards:
+        true(len(c) <= B.WORDS_PER_LINE,
+             f"card has {len(c)} words, limit is {B.WORDS_PER_LINE}")
+
+def t_group_breaks_on_sentence_end():
+    narration = "Fifteen years. That is how long."
+    words = fake_words([("Fifteen", 0.0, .4), ("years", .4, .4),
+                        ("That", .9, .3), ("is", 1.2, .2),
+                        ("how", 1.4, .2), ("long", 1.6, .4)])
+    cards = B.group_words(words, narration)
+    eq([w[2] for w in cards[0]], ["Fifteen", "years"],
+       "first card should stop at the full stop: ")
+
+def t_group_keeps_every_word():
+    narration = "One two three four five six seven eight nine."
+    words = fake_words([(w, i * .3, .25)
+                        for i, w in enumerate(narration.rstrip(".").split())])
+    cards = B.group_words(words, narration)
+    flat = [w[2] for c in cards for w in c]
+    eq(flat, [w[2] for w in words], "grouping must not drop or reorder words: ")
+
+def t_group_handles_empty():
+    eq(B.group_words([], ""), [])
+
+def t_group_no_punctuation():
+    """A narration with no full stops still chunks by word count."""
+    narration = "one two three four five six"
+    words = fake_words([(w, i * .3, .25) for i, w in enumerate(narration.split())])
+    cards = B.group_words(words, narration)
+    true(len(cards) >= 2, "expected chunking by word limit")
+
+# ── caption timing ────────────────────────────────────────────────────
+def t_windows_cover_everything():
+    """The regression this suite exists for: no bare frames, ever."""
+    words = fake_words([("a", 0.5, .3), ("b", 1.0, .3),
+                        ("c", 4.0, .3), ("d", 4.5, .3)])   # 2.5s of silence
+    cards = B.group_words(words, "a b. c d.")
+    dur = 8.0
+    win = B.card_windows(cards, dur)
+
+    cursor = 0.0
+    for start, end, _ in win:
+        true(start <= cursor + 1e-9,
+             f"gap in caption coverage at {cursor:.2f}s (next card at {start:.2f}s)")
+        cursor = max(cursor, end)
+    eq(round(cursor, 6), dur, "captions must run to the end of the scene: ")
+
+def t_windows_start_at_zero():
+    words = fake_words([("late", 2.0, .4)])
+    win = B.card_windows(B.group_words(words, "late."), 5.0)
+    eq(win[0][0], 0.0, "first card must be up from the first frame: ")
+
+def t_windows_are_ordered():
+    words = fake_words([(f"w{i}", i * 1.0, .5) for i in range(9)])
+    win = B.card_windows(B.group_words(words, " ".join(f"w{i}" for i in range(9))), 12.0)
+    for i in range(len(win) - 1):
+        true(win[i][1] <= win[i + 1][0] + 1e-9, "windows overlap")
+        true(win[i][0] < win[i][1], "window ends before it starts")
+
+def t_windows_single_card():
+    words = fake_words([("only", 0.2, .5)])
+    win = B.card_windows(B.group_words(words, "only."), 3.0)
+    eq(len(win), 1)
+    eq(win[0][0], 0.0)
+    eq(win[0][1], 3.0)
+
+# ── image handling ────────────────────────────────────────────────────
+def t_cover_exact_size():
+    for size in [(1920, 1080), (800, 600), (500, 2000), (3000, 400), (1280, 720)]:
+        out = B.cover(Image.new("RGB", size, (120, 90, 60)))
+        eq(out.size, (B.W, B.H), f"cover{size}: ")
+
+def t_cover_does_not_squeeze():
+    """
+    A circle must stay a circle. Squeezing is the defect this guards: a
+    non-uniform scale would turn it into an ellipse.
+    """
+    src = Image.new("RGB", (600, 600), (0, 0, 0))
+    from PIL import ImageDraw
+    ImageDraw.Draw(src).ellipse([100, 100, 500, 500], fill=(255, 255, 255))
+
+    a = np.array(B.cover(src).convert("L")) > 128
+    rows = np.where(a.any(axis=1))[0]
+    cols = np.where(a.any(axis=0))[0]
+    # The square source is cropped to 16:9, so the circle is clipped top and
+    # bottom; its full width must survive and match the uncropped diameter.
+    height = rows[-1] - rows[0] + 1
+    width  = cols[-1] - cols[0] + 1
+    true(width >= height,
+         f"aspect distorted: circle became {width}x{height}")
+    # cover() scales by max(W/w, H/h) — the same factor on both axes
+    scale = max(B.W / 600, B.H / 600)
+    expected_w = 400 * scale
+    true(abs(width - expected_w) <= 5,
+         f"width {width}px, expected about {expected_w:.0f}px — image was scaled non-uniformly")
+
+def t_cover_centres_crop():
+    src = Image.new("RGB", (2000, 500), (10, 10, 10))
+    from PIL import ImageDraw
+    ImageDraw.Draw(src).rectangle([980, 0, 1020, 500], fill=(255, 0, 0))
+    out = np.array(B.cover(src))
+    reds = np.where((out[:, :, 0] > 200) & (out[:, :, 1] < 60))[1]
+    true(len(reds) > 0, "centre marker was cropped away")
+    mid = (reds.min() + reds.max()) / 2
+    true(abs(mid - B.W / 2) < B.W * 0.06,
+         f"crop is off-centre: marker centred at {mid:.0f}, frame centre {B.W/2:.0f}")
+
+# ── frame rendering ───────────────────────────────────────────────────
+def t_compose_shape_and_type():
+    plate = Image.new("RGB", (B.W, B.H), (70, 70, 90))
+    words = fake_words([("hello", 0.0, .5), ("world", .5, .5)])
+    win = B.card_windows(B.group_words(words, "hello world."), 3.0)
+    frame = B.compose(plate, win, 1.0, 3.0, 1.0)
+    eq(frame.shape, (B.H, B.W, 3), "frame shape: ")
+    eq(frame.dtype, np.uint8, "frame dtype: ")
+
+def t_caption_actually_drawn():
+    """A frame with a caption must differ from the same frame without one."""
+    plate = Image.new("RGB", (B.W, B.H), (70, 70, 90))
+    words = fake_words([("hello", 0.0, .5)])
+    win = B.card_windows(B.group_words(words, "hello."), 3.0)
+    with_cap = B.compose(plate, win, 0.2, 3.0, 1.0)
+    without   = B.compose(plate, [], 0.2, 3.0, 1.0)
+    true(not np.array_equal(with_cap, without), "no caption was drawn")
+
+def t_highlight_moves_with_speech():
+    """The pill must be on a different word at different times."""
+    plate = Image.new("RGB", (B.W, B.H), (30, 30, 30))
+    words = fake_words([("alpha", 0.0, 1.0), ("bravo", 1.0, 1.0)])
+    win = B.card_windows(B.group_words(words, "alpha bravo"), 2.0)
+    early = B.compose(plate, win, 0.3, 2.0, 1.0)
+    late  = B.compose(plate, win, 1.3, 2.0, 1.0)
+    true(not np.array_equal(early, late),
+         "highlight did not move between the two words")
+
+    def pill_x(frame):
+        r, g, b = frame[:, :, 0].astype(int), frame[:, :, 1].astype(int), frame[:, :, 2].astype(int)
+        mask = (b > 120) & (r > 60) & (r < 190) & (g < 90)
+        xs = np.where(mask.any(axis=0))[0]
+        return xs.mean() if len(xs) else None
+
+    a, z = pill_x(early), pill_x(late)
+    true(a is not None and z is not None, "highlight pill not found")
+    true(z > a, f"pill should advance rightward: first at {a:.0f}, then {z:.0f}")
+
+def t_fade_darkens():
+    plate = Image.new("RGB", (B.W, B.H), (200, 200, 200))
+    full = B.compose(plate, [], 1.0, 3.0, 1.0)
+    dark = B.compose(plate, [], 1.0, 3.0, 0.2)
+    true(dark.mean() < full.mean() * 0.5, "fade did not darken the frame")
+
+def t_long_card_fits_width():
+    """An overlong card must shrink to fit, not run off the frame."""
+    plate = Image.new("RGB", (B.W, B.H), (0, 0, 0))
+    words = fake_words([("EXTRAORDINARILY", 0.0, .5), ("INCOMPREHENSIBLE", .5, .5),
+                        ("UNCHARACTERISTIC", 1.0, .5), ("DISPROPORTIONATE", 1.5, .5)])
+    win = B.card_windows(B.group_words(words, " ".join(w[2] for w in words)), 3.0)
+    frame = B.compose(plate, win, 0.2, 3.0, 1.0)
+    ink = np.where((frame.max(axis=2) > 40).any(axis=0))[0]
+    true(len(ink) > 0, "nothing was drawn")
+    true(ink.min() >= 0 and ink.max() < B.W,
+         f"caption spills outside the frame: x {ink.min()}..{ink.max()}")
+
+def t_ken_burns_moves():
+    plate = Image.new("RGB", (B.W, B.H), (0, 0, 0))
+    from PIL import ImageDraw
+    ImageDraw.Draw(plate).rectangle([600, 300, 680, 380], fill=(255, 255, 255))
+    a = B.ken_burns(plate, 0.0, 10.0)
+    b = B.ken_burns(plate, 9.0, 10.0)
+    true(not np.array_equal(np.array(a), np.array(b)), "plate is static")
+
+# ── output integrity ──────────────────────────────────────────────────
+def t_verify_rejects_missing():
+    ok, why = B.verify_video("/nonexistent/nope.mp4")
+    true(not ok, "missing file reported as valid")
+
+def t_verify_rejects_empty():
+    with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as f:
+        p = f.name
+    try:
+        ok, _ = B.verify_video(p)
+        true(not ok, "empty file reported as valid")
+    finally:
+        os.unlink(p)
+
+def t_verify_rejects_garbage():
+    with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as f:
+        f.write(b"this is not a video" * 500)
+        p = f.name
+    try:
+        ok, _ = B.verify_video(p)
+        true(not ok, "garbage reported as valid")
+    finally:
+        os.unlink(p)
+
+def t_verify_rejects_truncated():
+    """
+    The exact failure mode that kept surfacing: a real MP4 cut short before its
+    index was written. It must be rejected, not accepted as finished.
+    """
+    import imageio_ffmpeg
+    ffmpeg = imageio_ffmpeg.get_ffmpeg_exe()
+    d = tempfile.mkdtemp()
+    good = os.path.join(d, "good.mp4")
+    subprocess.run([ffmpeg, "-y", "-f", "lavfi", "-i", "color=c=blue:s=320x240:d=2",
+                    "-f", "lavfi", "-i", "anullsrc=r=44100:cl=stereo",
+                    "-t", "2", "-c:v", "libx264", "-c:a", "aac",
+                    "-pix_fmt", "yuv420p", good],
+                   capture_output=True)
+    ok, why = B.verify_video(good)
+    true(ok, f"a genuinely good file was rejected: {why}")
+
+    truncated = os.path.join(d, "cut.mp4")
+    data = open(good, "rb").read()
+    open(truncated, "wb").write(data[: len(data) // 3])      # chop off the tail
+    ok, why = B.verify_video(truncated)
+    true(not ok, "a truncated video passed verification")
+
+def t_verify_detects_missing_audio():
+    import imageio_ffmpeg
+    ffmpeg = imageio_ffmpeg.get_ffmpeg_exe()
+    d = tempfile.mkdtemp()
+    silent = os.path.join(d, "silent.mp4")
+    subprocess.run([ffmpeg, "-y", "-f", "lavfi", "-i", "color=c=red:s=320x240:d=2",
+                    "-c:v", "libx264", "-pix_fmt", "yuv420p", silent],
+                   capture_output=True)
+    ok, _ = B.verify_video(silent, expect_audio=True)
+    true(not ok, "a video with no audio passed an audio-required check")
+    ok, _ = B.verify_video(silent, expect_audio=False)
+    true(ok, "a silent video was rejected when audio was not required")
+
+# ── configuration sanity ──────────────────────────────────────────────
+def t_font_loads():
+    f = B.load_font(B.CAP_SIZE)
+    true(f is not None, "no font loaded")
+    from PIL import ImageDraw
+    w = ImageDraw.Draw(Image.new("RGB", (10, 10))).textlength("TEST", font=f)
+    true(w > 0, "font renders zero-width text")
+
+def t_caption_sits_inside_frame():
+    true(0.0 < B.CAP_Y < 1.0, f"CAP_Y {B.CAP_Y} is outside the frame")
+    true(B.CAP_Y * B.H + B.CAP_SIZE < B.H,
+         "captions would be drawn past the bottom edge")
+
+def t_settings_sane():
+    true(B.W > 0 and B.H > 0, "bad frame size")
+    true(B.FPS >= 24, f"fps {B.FPS} is too low")
+    true(B.WORDS_PER_LINE >= 1, "words per line must be at least 1")
+    true(len(B.HILITE) == 3 and all(0 <= c <= 255 for c in B.HILITE),
+         "highlight colour is not a valid RGB triple")
+
+# ── end-to-end ────────────────────────────────────────────────────────
+def t_end_to_end():
+    """Render a genuinely short video and verify the artefact."""
+    d = tempfile.mkdtemp()
+    script = os.path.join(d, "tiny.txt")
+    open(script, "w").write(
+        "# Test\n## a plain wooden table in soft daylight\n"
+        "This is a test. It is very short.\n")
+    out = os.path.join(d, "tiny.mp4")
+    B.build(script, out, work=os.path.join(d, "work"))
+    ok, why = B.verify_video(out, expect_audio=True, min_seconds=1.0)
+    true(ok, f"rendered video failed verification: {why}")
+    print(f"        rendered {os.path.getsize(out)/1e6:.1f}MB · {why}")
+
+# ── runner ────────────────────────────────────────────────────────────
+def main():
+    full = "--full" in sys.argv
+
+    groups = [
+        ("script parsing", [
+            ("parses title, scenes and narration", t_parse_basic),
+            ("joins consecutive narration lines", t_parse_multiline_narration),
+            ("handles narration before any scene", t_parse_narration_before_scene),
+            ("ignores blank lines", t_parse_blank_lines_ignored),
+            ("rejects a script with no narration", t_parse_empty_script_rejected),
+            ("every shipped script parses", t_parse_real_scripts),
+        ]),
+        ("word grouping", [
+            ("respects the words-per-card limit", t_group_respects_word_limit),
+            ("breaks cards at sentence ends", t_group_breaks_on_sentence_end),
+            ("never drops or reorders a word", t_group_keeps_every_word),
+            ("handles empty input", t_group_handles_empty),
+            ("chunks text with no punctuation", t_group_no_punctuation),
+        ]),
+        ("caption timing", [
+            ("leaves no uncovered time", t_windows_cover_everything),
+            ("first card is up from frame one", t_windows_start_at_zero),
+            ("windows are ordered and non-overlapping", t_windows_are_ordered),
+            ("a single card spans the whole scene", t_windows_single_card),
+        ]),
+        ("image handling", [
+            ("cover fills the frame exactly", t_cover_exact_size),
+            ("cover never squeezes the image", t_cover_does_not_squeeze),
+            ("cover crops from the centre", t_cover_centres_crop),
+        ]),
+        ("frame rendering", [
+            ("frame has the right shape and type", t_compose_shape_and_type),
+            ("caption is actually drawn", t_caption_actually_drawn),
+            ("highlight advances with speech", t_highlight_moves_with_speech),
+            ("fade darkens the frame", t_fade_darkens),
+            ("an overlong card stays inside the frame", t_long_card_fits_width),
+            ("ken burns keeps the plate moving", t_ken_burns_moves),
+        ]),
+        ("output integrity", [
+            ("rejects a missing file", t_verify_rejects_missing),
+            ("rejects an empty file", t_verify_rejects_empty),
+            ("rejects garbage", t_verify_rejects_garbage),
+            ("rejects a truncated video", t_verify_rejects_truncated),
+            ("detects a missing audio track", t_verify_detects_missing_audio),
+        ]),
+        ("configuration", [
+            ("a usable font is available", t_font_loads),
+            ("captions sit inside the frame", t_caption_sits_inside_frame),
+            ("settings are sane", t_settings_sane),
+        ]),
+    ]
+
+    if full:
+        groups.append(("end to end (network)", [
+            ("renders and verifies a real video", t_end_to_end),
+        ]))
+
+    for title, tests in groups:
+        print(f"\n{title}")
+        for name, fn in tests:
+            check(name, fn)
+
+    print("\n" + "─" * 60)
+    print(f"  {PASS} passed, {FAIL} failed")
+    if FAILURES:
+        print("─" * 60)
+        for name, tb in FAILURES:
+            print(f"\n{name}:\n{tb}")
+    if not full:
+        print("\n  (fast pass — run with --full to include a real render)")
+    print()
+    return 1 if FAIL else 0
+
+if __name__ == "__main__":
+    sys.exit(main())

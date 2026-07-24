@@ -115,6 +115,51 @@ def cover(img):
     return img.crop(((nw - W) // 2, (nh - H) // 2,
                      (nw - W) // 2 + W, (nh - H) // 2 + H))
 
+# ── output integrity ──────────────────────────────────────────────────
+def verify_video(path, expect_audio=True, min_seconds=0.5):
+    """
+    Is this a complete, playable MP4? -> (ok, reason)
+
+    An MP4's index (the `moov` atom) is written last, so a file truncated by a
+    crash, a full disk, or a reader arriving mid-write still looks like a video
+    by name and size. Probing is the only way to tell the difference.
+    """
+    if not os.path.exists(path):
+        return False, "file does not exist"
+    if os.path.getsize(path) < 1024:
+        return False, f"file is only {os.path.getsize(path)} bytes"
+
+    try:
+        import imageio_ffmpeg
+        ffmpeg = imageio_ffmpeg.get_ffmpeg_exe()
+    except Exception as e:
+        return False, f"ffmpeg unavailable: {e}"
+
+    probe = subprocess.run([ffmpeg, "-v", "error", "-i", path,
+                            "-f", "null", "-"],
+                           capture_output=True, text=True)
+    err = (probe.stderr or "").strip()
+    if "moov atom not found" in err:
+        return False, "truncated (no moov atom) — the encode never finished"
+    if probe.returncode != 0:
+        return False, f"unplayable: {err.splitlines()[0] if err else 'unknown'}"
+
+    meta = subprocess.run([ffmpeg, "-i", path], capture_output=True, text=True).stderr
+    if "Video:" not in meta:
+        return False, "no video stream"
+    if expect_audio and "Audio:" not in meta:
+        return False, "no audio stream"
+
+    m = re.search(r"Duration: (\d+):(\d+):(\d+\.?\d*)", meta)
+    if not m:
+        return False, "no duration reported"
+    hrs, mins, secs = int(m.group(1)), int(m.group(2)), float(m.group(3))
+    total = hrs * 3600 + mins * 60 + secs
+    if total < min_seconds:
+        return False, f"only {total:.2f}s long"
+
+    return True, f"{total:.1f}s"
+
 # ── voice + word timings ──────────────────────────────────────────────
 async def _speak(text, mp3):
     import edge_tts
@@ -300,22 +345,46 @@ def build(script_path, out_path, work=None, keep_plates=False):
                              bitrate="8000k", audio_bitrate="192k",
                              logger="bar", threads=4)
         clip.close()
+        # A scene that failed to finalise would poison the stitch with a
+        # confusing error much later, so catch it here where the cause is plain.
+        ok, why = verify_video(part, expect_audio=True)
+        if not ok:
+            raise SystemExit(f"scene {i + 1} did not encode cleanly: {why}")
         parts.append(part)
 
     print("\n── stitch ──")
     ins = [x for p in parts for x in ("-i", p)]
     n   = len(parts)
     fc  = "".join(f"[{i}:v][{i}:a]" for i in range(n)) + f"concat=n={n}:v=1:a=1[v][a]"
-    os.makedirs(os.path.dirname(os.path.abspath(out_path)), exist_ok=True)
-    r = subprocess.run([FFMPEG, "-y", *ins, "-filter_complex", fc,
-                        "-map", "[v]", "-map", "[a]",
-                        "-c:v", "libx264", "-preset", "medium", "-crf", "19",
-                        "-pix_fmt", "yuv420p",
-                        "-c:a", "aac", "-b:a", "192k",
-                        "-movflags", "+faststart", out_path],
-                       capture_output=True, text=True)
-    if r.returncode:
-        print(r.stderr[-2500:]); raise SystemExit("stitch failed")
+    out_path = os.path.abspath(out_path)
+    os.makedirs(os.path.dirname(out_path), exist_ok=True)
+
+    # Write to a sibling temp file, then rename into place. A reader at
+    # out_path therefore sees either nothing or a complete, verified video —
+    # never the half-written file that an interrupted encode leaves behind.
+    # The .mp4 suffix stays on the end: ffmpeg picks its muxer from the
+    # extension, and a bare ".part" leaves it unable to choose one.
+    tmp = f"{out_path}.part.mp4"
+    try:
+        r = subprocess.run([FFMPEG, "-y", *ins, "-filter_complex", fc,
+                            "-map", "[v]", "-map", "[a]",
+                            "-c:v", "libx264", "-preset", "medium", "-crf", "19",
+                            "-pix_fmt", "yuv420p",
+                            "-c:a", "aac", "-b:a", "192k",
+                            "-movflags", "+faststart", tmp],
+                           capture_output=True, text=True)
+        if r.returncode:
+            print(r.stderr[-2500:])
+            raise SystemExit("stitch failed")
+
+        ok, why = verify_video(tmp, expect_audio=True)
+        if not ok:
+            raise SystemExit(f"stitched file failed verification: {why}")
+
+        os.replace(tmp, out_path)          # atomic within the same filesystem
+    finally:
+        if os.path.exists(tmp):
+            os.remove(tmp)
 
     if not keep_plates:
         for f in os.listdir(work):

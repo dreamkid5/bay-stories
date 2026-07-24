@@ -42,6 +42,10 @@ jobs:
       - name: Install Python dependencies
         run: pip install -r requirements.txt
 
+      # Catch a broken renderer before spending 10+ minutes rendering with it.
+      - name: Run tests
+        run: python test_bay_studio.py
+
       - name: Work out which scripts to render
         id: pick
         run: |
