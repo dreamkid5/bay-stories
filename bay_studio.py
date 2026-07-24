@@ -159,6 +159,21 @@ def group_words(words, narration="", per_line=WORDS_PER_LINE):
         cards.append(cur)
     return cards
 
+def card_windows(cards, dur):
+    """
+    How long each card stays on screen -> [(show_from, show_until, card)].
+
+    A card holds until the next one takes over, rather than vanishing when its
+    last word finishes. Speakers pause between sentences, and timing cards to
+    speech alone leaves the frame bare for a quarter of the run.
+    """
+    out = []
+    for i, card in enumerate(cards):
+        start = 0.0 if i == 0 else card[0][0]
+        end   = cards[i + 1][0][0] if i + 1 < len(cards) else dur
+        out.append((start, end, card))
+    return out
+
 # ── caption drawing ───────────────────────────────────────────────────
 _font = load_font(CAP_SIZE)
 
@@ -216,7 +231,7 @@ def ken_burns(plate, t, dur):
     oy = int((H - ch) * (0.5 + 0.16 * np.cos(t * 0.10)))
     return plate.crop((ox, oy, ox + cw, oy + ch)).resize((W, H), Image.LANCZOS)
 
-def compose(plate, cards, t, dur, fade):
+def compose(plate, windows, t, dur, fade):
     frame = ken_burns(plate, t, dur).convert("RGBA")
 
     # gentle top/bottom falloff — keeps captions legible on bright plates
@@ -227,8 +242,8 @@ def compose(plate, cards, t, dur, fade):
     a[:, :, :3] *= ramp[:, None, None]
     frame = Image.fromarray(np.clip(a, 0, 255).astype(np.uint8))
 
-    for card in cards:
-        if card[0][0] <= t < card[-1][0] + card[-1][1] + 0.18:
+    for start, end, card in windows:
+        if start <= t < end:
             draw_caption(frame, card, t)
             break
 
@@ -258,6 +273,7 @@ def build(script_path, out_path, work=None, keep_plates=False):
         sc["cards"] = group_words(sc["words"], sc["narration"])
         sc["mp3"]   = mp3
         sc["dur"]   = AudioFileClip(mp3).duration
+        sc["windows"] = card_windows(sc["cards"], sc["dur"])
         print(f"   {i+1}. {sc['dur']:5.1f}s · {len(sc['words'])} words "
               f"· {len(sc['cards'])} cards")
 
@@ -272,11 +288,11 @@ def build(script_path, out_path, work=None, keep_plates=False):
     print("\n── render ──")
     FADE, parts = 0.35, []
     for i, sc in enumerate(scenes):
-        dur, cards, plate = sc["dur"], sc["cards"], sc["plate"]
+        dur, windows, plate = sc["dur"], sc["windows"], sc["plate"]
 
-        def make(t, dur=dur, cards=cards, plate=plate):
+        def make(t, dur=dur, windows=windows, plate=plate):
             fade = min(1.0, t / FADE, (dur - t) / FADE)
-            return compose(plate, cards, t, dur, fade)
+            return compose(plate, windows, t, dur, fade)
 
         clip = VideoClip(make, duration=dur).with_audio(AudioFileClip(sc["mp3"]))
         part = os.path.join(work, f"scene_{i}.mp4")
