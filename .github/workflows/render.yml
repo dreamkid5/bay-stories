@@ -138,7 +138,10 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: videos-${{ github.run_number }}
-          path: videos/*.mp4
+          # each video ships with its matching .jpg thumbnail
+          path: |
+            videos/*.mp4
+            videos/*.jpg
           retention-days: 30
           if-no-files-found: error
 
@@ -152,8 +155,9 @@ jobs:
         run: |
           tag="render-${{ github.run_number }}"
           name="$(ls videos/*.mp4 | head -1 | xargs basename | sed 's/\.mp4$//')"
-          gh release create "$tag" videos/*.mp4 \
+          # Attach both the video and its thumbnail to the release.
+          gh release create "$tag" videos/*.mp4 videos/*.jpg \
             --title "🎬 ${name} (run ${{ github.run_number }})" \
-            --notes "Your video is attached below — click the .mp4 to download.
+            --notes "Your video (.mp4) and its thumbnail (.jpg) are attached below.
 
           Rendered $(date -u '+%Y-%m-%d %H:%M UTC')."

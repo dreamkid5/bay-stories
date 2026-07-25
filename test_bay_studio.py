@@ -313,6 +313,67 @@ def t_compose_without_character_still_works():
     frame = B.compose(plate, win, 0.2, 2.0, 1.0, None)
     eq(frame.shape, (B.H, B.W, 3))
 
+def t_hook_from_scenes_trims():
+    scenes = [dict(narration="One two three four five six seven eight."),
+              dict(narration="Nine ten eleven twelve.")]
+    hook = B.hook_from_scenes(scenes, max_words=5)
+    eq(len(hook.rstrip("…").split()), 5, "hook word count: ")
+    true(hook.endswith("…"), "a clipped hook should end with an ellipsis")
+
+def t_hook_short_story_not_clipped():
+    scenes = [dict(narration="Just three words.")]
+    hook = B.hook_from_scenes(scenes, max_words=40)
+    true(not hook.endswith("…"), "a short story should not be clipped")
+
+def t_colorize_keeps_all_words():
+    hook = '"You have been replaced," my husband said. She owed $580,000.'
+    toks = B.colorize_hook(hook)
+    got = " ".join(w for w, _ in toks)
+    for word in ["You", "husband", "said.", "$580,000."]:
+        true(word in got, f"colorize dropped {word!r}")
+
+def t_colorize_money_is_red():
+    toks = B.colorize_hook("She was left with $580,000 in debt.")
+    reds = [w for w, c in toks if c == B.T_RED]
+    true(any("580" in w or "$" in w for w in reds),
+         "the money clause should be red")
+
+def t_colorize_quotes_get_accent():
+    toks = B.colorize_hook('He said "get out" to me.')
+    quoted = [c for w, c in toks if w.strip('"').lower() in ("get", "out") or '"' in w]
+    true(any(c != B.T_WHITE for c in quoted), "quoted speech should be accented")
+
+def t_thumbnail_is_written_and_sized():
+    import tempfile as _tf
+    # a stand-in narrator cutout
+    ch = Image.new("RGBA", (400, 700), (200, 180, 150, 255))
+    out = os.path.join(_tf.mkdtemp(), "t.jpg")
+    B.make_thumbnail('"Hello there," she said. It cost $5.', ch, out)
+    true(os.path.exists(out), "thumbnail file was not written")
+    im = Image.open(out)
+    eq(im.size, (B.THUMB_W, B.THUMB_H), "thumbnail size: ")
+
+def t_thumbnail_without_narrator():
+    import tempfile as _tf
+    out = os.path.join(_tf.mkdtemp(), "t.jpg")
+    B.make_thumbnail("A story with no face.", None, out)
+    true(os.path.exists(out), "thumbnail must still render with no narrator")
+
+def t_thumbnail_has_colour():
+    """The thumbnail must actually contain the accent colours, not just white."""
+    import tempfile as _tf
+    out = os.path.join(_tf.mkdtemp(), "t.jpg")
+    hook = ("He left without a word. She sold the house, took the car, "
+            "and vanished. Then the debt arrived: $580,000 owed.")
+    B.make_thumbnail(hook, None, out)
+    a = np.array(Image.open(out).convert("RGB")).reshape(-1, 3)
+    # a pixel is "coloured" if one channel clearly leads the others
+    r, g, b = a[:, 0].astype(int), a[:, 1].astype(int), a[:, 2].astype(int)
+    reddish   = ((r > 150) & (r - g > 60) & (r - b > 60)).sum()
+    greenish  = ((g > 150) & (g - r > 40) & (g - b > 30)).sum()
+    true(reddish > 200, "no red accent found on the money clause")
+    true(greenish > 200, "no green accent found in the thumbnail")
+
 def t_output_is_high_definition():
     true(B.H >= 1080, f"frame is only {B.H}px tall; want at least 1080 for HD")
     true(B.W / B.H > 1.7, "frame is not 16:9 widescreen")
@@ -630,6 +691,16 @@ def main():
             ("renders fine with no character", t_compose_without_character_still_works),
             ("output is high definition", t_output_is_high_definition),
             ("the plate keeps its detail", t_plate_keeps_detail),
+        ]),
+        ("thumbnail", [
+            ("hook trims a long opening", t_hook_from_scenes_trims),
+            ("a short story is not clipped", t_hook_short_story_not_clipped),
+            ("colorize keeps every word", t_colorize_keeps_all_words),
+            ("money turns red", t_colorize_money_is_red),
+            ("quotes get an accent colour", t_colorize_quotes_get_accent),
+            ("thumbnail is written at the right size", t_thumbnail_is_written_and_sized),
+            ("thumbnail renders without a narrator", t_thumbnail_without_narrator),
+            ("thumbnail actually has colour", t_thumbnail_has_colour),
         ]),
         ("output integrity", [
             ("rejects a missing file", t_verify_rejects_missing),

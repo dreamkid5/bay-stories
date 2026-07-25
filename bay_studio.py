@@ -647,6 +647,139 @@ def compose(plate, windows, t, dur, fade, character=None):
         out = (out.astype(np.float32) * fade).astype(np.uint8)
     return out
 
+# ── thumbnail ─────────────────────────────────────────────────────────
+THUMB_W, THUMB_H = 1280, 720
+THUMB_FONT = os.path.join(HERE, "fonts", "Baloo2-ExtraBold.ttf")
+
+# The reference palette: white body copy with bright accents on the beats.
+T_WHITE  = (255, 255, 255)
+T_GREEN  = (128, 246, 120)
+T_YELLOW = (255, 224, 64)
+T_RED    = (255, 72, 66)
+T_PINK   = (255, 95, 205)
+
+def _thumb_font(size):
+    try:
+        f = ImageFont.truetype(THUMB_FONT, size)
+        try:    f.set_variation_by_name("ExtraBold")
+        except Exception: pass
+        return f
+    except Exception:
+        return load_font(size)
+
+def hook_from_scenes(scenes, max_words=42):
+    """The opening of the story, trimmed to a punchy thumbnail hook."""
+    words = []
+    for sc in scenes:
+        words += sc["narration"].split()
+        if len(words) >= max_words:
+            break
+    clipped = len(words) > max_words
+    text = " ".join(words[:max_words]).rstrip(",;:-—– ")
+    return text + ("…" if clipped else "")
+
+def colorize_hook(hook):
+    """
+    -> [(word, colour)]. Quoted speech rotates through the bright accents,
+    anything with money or a number turns red, and every so often a clause
+    goes green — the lively, uneven emphasis the reference thumbnail uses.
+    """
+    accents = [T_PINK, T_YELLOW, T_GREEN]
+    qi = ci = 0
+    out = []
+    for part in re.split(r'("[^"]*"|“[^”]*”|\'[^\']*\')', hook):
+        if not part:
+            continue
+        if part[0] in "\"'“":                       # a quoted span
+            col = accents[qi % len(accents)]; qi += 1
+            for w in part.split():
+                out.append((w, col))
+        else:
+            for clause in re.split(r'(?<=[,.;:—–])\s+', part):
+                clause = clause.strip()
+                if not clause:
+                    continue
+                if re.search(r"[\$]|\d", clause):        # money or a number
+                    col = T_RED
+                elif ci % 3 == 1:
+                    col = T_GREEN
+                else:
+                    col = T_WHITE
+                ci += 1
+                for w in clause.split():
+                    out.append((w, col))
+    return out
+
+def _wrap_colored(tokens, font, max_w):
+    d = ImageDraw.Draw(Image.new("RGB", (1, 1)))
+    space = d.textlength(" ", font=font)
+    lines, cur, curw = [], [], 0.0
+    for word, col in tokens:
+        ww = d.textlength(word, font=font)
+        if cur and curw + space + ww > max_w:
+            lines.append(cur); cur, curw = [], 0.0
+        if cur:
+            curw += space
+        cur.append((word, col, ww)); curw += ww
+    if cur:
+        lines.append(cur)
+    return lines, space
+
+def make_thumbnail(hook, narrator_cut, out_path):
+    """A YouTube-style thumbnail: coloured hook on the left, narrator on the right."""
+    W2, H2 = THUMB_W, THUMB_H
+    canvas = Image.new("RGB", (W2, H2), (20, 21, 26))
+
+    # subtle vignette so the flat dark ground has a little depth
+    a = np.array(canvas).astype(np.float32)
+    yy, xx = np.meshgrid(np.linspace(-1, 1, H2), np.linspace(-1, 1, W2), indexing="ij")
+    a *= np.clip(1 - (yy ** 2 * 0.25 + xx ** 2 * 0.18), 0.6, 1.0)[:, :, None]
+    canvas = Image.fromarray(a.astype(np.uint8)).convert("RGBA")
+
+    # narrator on the right, full height, feathered inner edge already present
+    person_w = 0
+    if narrator_cut is not None:
+        scale = H2 / narrator_cut.height
+        person = narrator_cut.resize(
+            (max(1, round(narrator_cut.width * scale)), H2), Image.LANCZOS)
+        person_w = person.width
+        canvas.alpha_composite(person, (W2 - person_w, 0))
+
+    # text area: everything left of the narrator, with margins
+    margin = 46
+    area_x0, area_y0 = margin, margin
+    area_x1 = W2 - person_w + int(person_w * 0.18)   # may tuck under the feather
+    area_x1 = min(area_x1, W2 - margin)
+    area_w  = area_x1 - area_x0
+    area_h  = H2 - margin * 2
+
+    tokens = colorize_hook(hook)
+
+    # largest font whose wrapped height fits the area
+    font = _thumb_font(64)
+    lines, space = _wrap_colored(tokens, font, area_w)
+    for size in range(78, 30, -3):
+        font = _thumb_font(size)
+        lines, space = _wrap_colored(tokens, font, area_w)
+        lh = size * 1.22
+        if len(lines) * lh <= area_h:
+            break
+    lh = font.size * 1.22
+
+    d = ImageDraw.Draw(canvas)
+    stroke = max(3, int(font.size * 0.09))
+    y = area_y0 + (area_h - len(lines) * lh) / 2         # vertically centred
+    for line in lines:
+        x = area_x0
+        for word, col, ww in line:
+            d.text((x, y), word, font=font, fill=(*col, 255),
+                   stroke_width=stroke, stroke_fill=(0, 0, 0, 255))
+            x += ww + space
+        y += lh
+
+    canvas.convert("RGB").save(out_path, quality=92)
+    return out_path
+
 # ── build ─────────────────────────────────────────────────────────────
 def build(script_path, out_path, work=None, keep_plates=False):
     from moviepy import VideoClip, AudioFileClip
@@ -688,6 +821,12 @@ def build(script_path, out_path, work=None, keep_plates=False):
                                 random.randint(1, 10**6))
     narrator_cut = prepare_character(char_path) if char_path else None
     print(f"   {'cut ' + str(narrator_cut.size) if narrator_cut else 'FAILED — playing full-bleed'}")
+
+    # A thumbnail written next to the video, sharing its name with a .jpg suffix.
+    thumb_path = os.path.splitext(out_path)[0] + ".jpg"
+    os.makedirs(os.path.dirname(os.path.abspath(thumb_path)), exist_ok=True)
+    make_thumbnail(hook_from_scenes(scenes), narrator_cut, thumb_path)
+    print(f"── thumbnail ──\n   {thumb_path}")
 
     print("\n── render ──")
     FADE, parts = 0.35, []
