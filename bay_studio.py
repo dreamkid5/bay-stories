@@ -34,9 +34,16 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 
 # ── look ──────────────────────────────────────────────────────────────
 W, H, FPS = 1920, 1080, 30           # full HD — plates keep their detail
-VOICE     = "en-US-ChristopherNeural"
-RATE      = "-6%"
-PITCH     = "-3Hz"
+
+# The voice follows the narrator's gender so a woman's story is read by a
+# woman. These are the newest, most natural neural voices — expressive enough
+# to carry the emotional beats these stories live on.
+VOICE_MALE    = "en-US-AndrewMultilingualNeural"
+VOICE_FEMALE  = "en-US-AvaMultilingualNeural"
+VOICE         = VOICE_MALE           # fallback when speak() is called directly
+VOICE_OVERRIDE = None                # set by --voice to force one voice
+RATE          = "-4%"                # a touch slower — measured, not rushed
+PITCH         = "+0Hz"
 
 CAP_SIZE     = 92                    # caption cap height (scaled for 1080p)
 CAP_Y        = 0.62                  # caption baseline, fraction of height
@@ -594,9 +601,9 @@ def verify_video(path, expect_audio=True, min_seconds=0.5):
     return True, f"{total:.1f}s"
 
 # ── voice + word timings ──────────────────────────────────────────────
-async def _speak(text, mp3):
+async def _speak(text, mp3, voice):
     import edge_tts
-    comm = edge_tts.Communicate(text, VOICE, rate=RATE, pitch=PITCH,
+    comm = edge_tts.Communicate(text, voice, rate=RATE, pitch=PITCH,
                                 boundary="WordBoundary")
     words, audio = [], bytearray()
     async for ch in comm.stream():
@@ -607,8 +614,8 @@ async def _speak(text, mp3):
     open(mp3, "wb").write(bytes(audio))
     return words
 
-def speak(text, mp3):
-    return asyncio.run(_speak(text, mp3))
+def speak(text, mp3, voice=None):
+    return asyncio.run(_speak(text, mp3, voice or VOICE))
 
 def group_words(words, narration="", per_line=WORDS_PER_LINE):
     """
@@ -1030,14 +1037,19 @@ def build(script_path, out_path, work=None, keep_plates=False):
     work = work or os.path.join(HERE, "out", str(run))
     os.makedirs(work, exist_ok=True)
 
+    # Voice matches the narrator's gender unless the CLI forced one.
+    gender = infer_gender(narrator)
+    voice  = VOICE_OVERRIDE or (VOICE_FEMALE if gender == "female" else VOICE_MALE)
+
     print(f"▶ {title}")
     print(f"  {len(scenes)} scenes · seed {run}")
-    print(f"  narrator: {narrator}\n")
+    print(f"  narrator: {narrator}")
+    print(f"  voice: {voice}\n")
 
     print("── voice ──")
     for i, sc in enumerate(scenes):
         mp3 = os.path.join(work, f"vo_{i}.mp3")
-        sc["words"] = speak(sc["narration"], mp3)
+        sc["words"] = speak(sc["narration"], mp3, voice)
         sc["cards"] = group_words(sc["words"], sc["narration"])
         sc["mp3"]   = mp3
         sc["dur"]   = AudioFileClip(mp3).duration
@@ -1136,14 +1148,15 @@ def build(script_path, out_path, work=None, keep_plates=False):
     return out_path
 
 def main():
-    global VOICE
+    global VOICE_OVERRIDE
     ap = argparse.ArgumentParser(description="Build a narration video from a script.")
     ap.add_argument("--script", required=True, help="path to the story script")
     ap.add_argument("--out", default=os.path.expanduser("~/Desktop/bay_story.mp4"))
-    ap.add_argument("--voice", default=VOICE)
+    ap.add_argument("--voice", default=None,
+                    help="force a specific edge-tts voice (default: chosen by narrator gender)")
     ap.add_argument("--keep", action="store_true", help="keep intermediate files")
     a = ap.parse_args()
-    VOICE = a.voice
+    VOICE_OVERRIDE = a.voice           # None => pick by gender
     build(a.script, a.out, keep_plates=a.keep)
 
 if __name__ == "__main__":
