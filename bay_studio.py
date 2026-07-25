@@ -253,6 +253,10 @@ _MALE_CUES = [
     "goodnight dad", "love you dad", "hey dad", "thanks dad", "their dad",
     "i'm their dad", "their father", "as their dad", "being a dad", "a father of",
     "widower", "my wife's", "she married me",
+    # first-person "I am/was her/his father/dad"
+    "i was her father", "i am her father", "i'm her father", "i was his father",
+    "i am his father", "i'm his father", "i was her dad", "i was his dad",
+    "i'm her dad", "i'm his dad", "i am her dad", "i am his dad", "her real father",
 ]
 _FEMALE_CUES = [
     "my husband", "my boyfriend", "my ex-husband", "my ex husband", "as a mother",
@@ -264,6 +268,10 @@ _FEMALE_CUES = [
     "i'm their mom", "their mother", "as their mom", "being a mom", "a mother of",
     "widow", "pregnant", "gave birth", "my pregnancy", "i was pregnant", "in labor",
     "my husband's", "he married me", "my wedding dress", "my baby",
+    # first-person "I am/was her/his mother/mom"
+    "i was her mother", "i am her mother", "i'm her mother", "i was his mother",
+    "i am his mother", "i'm his mother", "i was her mom", "i was his mom",
+    "i'm her mom", "i'm his mom", "i am her mom", "i am his mom", "her real mother",
 ]
 
 def infer_gender(text):
