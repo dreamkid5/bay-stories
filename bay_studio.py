@@ -50,7 +50,7 @@ CAP_Y        = 0.62                  # caption baseline, fraction of height
 WORDS_PER_LINE = 4                   # words visible at once
 HILITE       = (124, 42, 232)        # pill behind the spoken word
 CHAR_BAND    = 0.30                  # width of the frame the narrator may use
-CHAR_SIDE    = "right"               # which side the narrator stands on
+CHAR_SIDE    = "left"                # which side the narrator stands on
 PLATE_DARKEN = 0.94                  # how much to dim the plate (1.0 = none)
 
 FONT_CANDIDATES = [
