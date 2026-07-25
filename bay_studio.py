@@ -93,6 +93,12 @@ def parse_script(path):
     if not scenes:
         raise SystemExit("script has no narration")
 
+    # Work out the narrator's gender up front so first-person beats ("I sat
+    # alone…") can be drawn as the right person.
+    body   = title + " " + " ".join(s["narration"] for s in scenes)
+    gender = infer_gender(narrator if narrator else body)
+    i_subject = "a young woman" if gender == "female" else "a young man"
+
     # Any scene whose narration runs long — most of all a raw story pasted with
     # no ## breaks at all — is split into scene-sized beats, each with its own
     # image, so a long video keeps changing on screen instead of holding one
@@ -100,7 +106,7 @@ def parse_script(path):
     expanded = []
     for s in scenes:
         if len(s["narration"].split()) > SCENE_MAX_WORDS:
-            expanded.extend(auto_segment(s["narration"]))
+            expanded.extend(auto_segment(s["narration"], i_subject))
         else:
             expanded.append(s)
     scenes = expanded
@@ -111,59 +117,107 @@ def parse_script(path):
                           "shallow depth of field, 4k")
 
     if not narrator:
-        body = title + " " + " ".join(s["narration"] for s in scenes)
-        narrator = describe_narrator(infer_gender(body))
+        narrator = describe_narrator(gender)
     return title, narrator, scenes
 
 # ── auto scene segmentation ───────────────────────────────────────────
 SCENE_MAX_WORDS = 60          # a scene longer than this is split
 SCENE_TARGET    = 46          # aim for beats of about this many words
 
-# Concrete things an image model can actually draw, and meta-narration it can't.
-_VISUAL_NOUNS = {
-    "room", "house", "home", "hospital", "bed", "car", "door", "window", "table",
-    "kitchen", "street", "phone", "hand", "hands", "face", "baby", "daughter",
-    "son", "husband", "wife", "mother", "father", "office", "court", "courtroom",
-    "garden", "rain", "night", "morning", "light", "chair", "floor", "dress",
-    "suit", "mirror", "bathroom", "bedroom", "dinner", "coffee", "letter", "ring",
-    "hallway", "porch", "yard", "kids", "children", "family", "nurse", "doctor",
-    "church", "grave", "airport", "station", "school", "desk", "couch", "sofa",
-    "field", "road", "city", "window", "photograph", "photo", "wedding", "gift",
-}
-_META_OPENERS = ("i want you", "i need you", "this is my story", "let me tell",
-                 "i'll tell you", "here is what", "understand this", "sit with that",
-                 "and when i", "but first", "you see")
+# Building a backdrop prompt by KEYWORD instead of by sentence. Feeding a raw
+# first-person sentence to the image model gives gibberish, because it is not
+# written to be seen. Instead each beat is mined for who is in it, where it
+# happens, and how it feels, and those are assembled into a clean, drawable
+# scene. Lists are ordered specific-first so "grandmother" wins over "mother".
+_SUBJECTS = [
+    ("newborn", "a newborn baby"), ("baby", "a newborn baby"),
+    ("grandmother", "an older woman"), ("grandma", "an older woman"),
+    ("grandfather", "an older man"), ("grandpa", "an older man"),
+    ("daughter", "a young girl"), ("son", "a young boy"),
+    ("husband", "a man"), ("wife", "a woman"),
+    ("mother", "a woman"), ("mom", "a woman"), ("mum", "a woman"),
+    ("father", "a man"), ("dad", "a man"),
+    ("boyfriend", "a young man"), ("girlfriend", "a young woman"),
+    ("nurse", "a nurse"), ("doctor", "a doctor"),
+    ("lawyer", "a lawyer"), ("attorney", "a lawyer"), ("judge", "a judge"),
+    ("boss", "a stern manager"), ("teacher", "a teacher"),
+    ("family", "a family"), ("couple", "a couple"),
+    ("children", "children"), ("kids", "children"),
+    ("girl", "a young woman"), ("boy", "a young man"),
+    ("woman", "a woman"), ("man", "a man"),
+    ("she", "a woman"), ("he", "a man"),
+]
+_SETTINGS = [
+    ("hospital", "a hospital room"), ("courtroom", "a courtroom"),
+    ("court", "a courtroom"), ("kitchen", "a kitchen"),
+    ("bedroom", "a bedroom"), ("bathroom", "a bathroom"),
+    ("living room", "a living room"), ("office", "an office"),
+    ("restaurant", "a restaurant"), ("diner", "a diner"),
+    ("church", "a church"), ("wedding", "a wedding"),
+    ("funeral", "a cemetery"), ("cemetery", "a cemetery"), ("grave", "a cemetery"),
+    ("airport", "an airport"), ("hotel", "a hotel room"),
+    ("prison", "a prison visiting room"), ("jail", "a prison visiting room"),
+    ("school", "a school hallway"), ("university", "a college campus"),
+    ("college", "a college campus"), ("garden", "a garden"),
+    ("backyard", "a backyard"), ("porch", "a front porch"),
+    ("store", "a store"), ("shop", "a store"), ("market", "a market"),
+    ("car", "inside a car"), ("street", "a city street"), ("road", "a country road"),
+    ("dinner", "a dining table"), ("table", "a dining table"),
+    ("hospital bed", "a hospital room"), ("bed", "a bedroom"),
+    ("house", "a family home"), ("home", "a family home"), ("apartment", "an apartment"),
+]
+_MOODS = [
+    ("sobbing", "tearful and emotional"), ("crying", "tearful and emotional"),
+    ("cried", "tearful and emotional"), ("tears", "tearful and emotional"),
+    ("screaming", "tense and dramatic"), ("screamed", "tense and dramatic"),
+    ("yelling", "tense and dramatic"), ("shouted", "tense and dramatic"),
+    ("furious", "angry confrontation"), ("angry", "angry confrontation"),
+    ("terrified", "fearful, shadowy"), ("scared", "fearful, shadowy"),
+    ("afraid", "fearful, shadowy"), ("alone", "alone and isolated"),
+    ("lonely", "alone and isolated"), ("cold", "cold and somber"),
+    ("silence", "quiet and still"), ("quiet", "quiet and still"),
+    ("smiled", "warm and gentle"), ("laughed", "warm and gentle"),
+    ("happy", "warm and gentle"), ("rain", "rain, moody atmosphere"),
+    ("storm", "storm, moody atmosphere"), ("shocked", "stunned expression"),
+    ("stunned", "stunned expression"),
+]
+_TIME = [
+    ("midnight", "at night, dim light"), ("night", "at night, dim light"),
+    ("dark", "low light, shadows"), ("dawn", "soft dawn light"),
+    ("sunrise", "soft dawn light"), ("morning", "soft morning light"),
+    ("sunset", "golden sunset light"), ("dusk", "golden dusk light"),
+    ("evening", "warm evening light"),
+]
 
-def _visual_prompt(sentences):
-    """
-    Turn a beat of narration into a backdrop prompt. Prefers the most visual
-    sentence — one naming things a camera could see — over abstract first-person
-    reflection, which the image model cannot render into anything meaningful.
-    """
-    cands = [s for s in sentences if '"' not in s and '“' not in s] or sentences
+def _hits(low, table, limit):
+    out = []
+    for key, phrase in table:
+        if re.search(rf"\b{re.escape(key)}\b", low) and phrase not in out:
+            out.append(phrase)
+            if len(out) >= limit:
+                break
+    return out
 
-    def visual_score(s):
-        low = s.lower()
-        if any(low.lstrip().startswith(m) for m in _META_OPENERS):
-            return -1
-        return sum(1 for n in _VISUAL_NOUNS if re.search(rf"\b{n}\b", low))
+def scene_prompt(narration, i_subject="a young person"):
+    """A clean, drawable backdrop prompt assembled from a beat's key elements."""
+    low = " " + narration.lower() + " "
+    who     = _hits(low, _SUBJECTS, 2)
+    setting = _hits(low, _SETTINGS, 1)
+    mood    = _hits(low, _MOODS, 1) + _hits(low, _TIME, 1)
 
-    best   = max(cands, key=lambda s: (visual_score(s), len(s)))
-    scored = visual_score(best)
-    base   = re.sub(r'["“”‘’\']', "", best)
-    base   = re.sub(r"\s+", " ", base).strip(" .,;:—–")
-    words  = base.split()
-    if len(words) > 16:
-        base = " ".join(words[:16])
-    if not base:
-        return "quiet emotional moment, cinematic"
-    # Abstract beat with nothing to picture — lean on mood instead of the words.
-    if scored <= 0:
-        return f"emotional cinematic moment evoking: {base}"
-    return base
+    if not who and re.search(r"\b(i|me|my|myself|we|our)\b", low):
+        who = [i_subject]                              # first-person narrator
+    if not who:
+        who = ["a person"]
 
-def auto_segment(narration, target=SCENE_TARGET):
-    """Long narration -> [ {image, narration}, ... ] split on sentence bounds."""
+    parts = [" and ".join(who)]
+    if setting:
+        parts.append("in " + setting[0])
+    parts.append(", ".join(mood) if mood else "emotional, cinematic atmosphere")
+    return ", ".join(parts)
+
+def auto_segment(narration, i_subject="a young person", target=SCENE_TARGET):
+    """Long narration -> [ {image, narration, auto}, ... ] split on sentence bounds."""
     sents = _sentences(narration)
     groups, cur, wc = [], [], 0
     for s in sents:
@@ -176,7 +230,8 @@ def auto_segment(narration, target=SCENE_TARGET):
             groups[-1].extend(cur)
         else:
             groups.append(cur)
-    return [dict(image=_visual_prompt(g), narration=" ".join(g)) for g in groups]
+    return [dict(image=scene_prompt(" ".join(g), i_subject),
+                 narration=" ".join(g), auto=True) for g in groups]
 
 # ── who the narrator is ───────────────────────────────────────────────
 # Whole phrases, not loose words: "wife" alone tells you nothing about the
@@ -247,13 +302,20 @@ def fetch_plate(prompt, path, seed):
     return None
 
 def cover(img):
-    """Fill the frame preserving aspect — crop the overflow, never squeeze."""
+    """
+    Fill the frame preserving aspect — crop the overflow, never squeeze. The
+    free image tier caps output around 1024×576, so plates are upscaled to fill
+    an HD frame; an unsharp pass restores the edge detail that plain upscaling
+    smears, which is what otherwise reads as a soft, compressed background.
+    """
     iw, ih = img.size
     scale  = max(W / iw, H / ih)
     nw, nh = int(round(iw * scale)), int(round(ih * scale))
-    img = img.resize((nw, nh), Image.LANCZOS)
-    return img.crop(((nw - W) // 2, (nh - H) // 2,
-                     (nw - W) // 2 + W, (nh - H) // 2 + H))
+    img = img.resize((nw, nh), Image.LANCZOS).crop(
+        ((nw - W) // 2, (nh - H) // 2, (nw - W) // 2 + W, (nh - H) // 2 + H))
+    if scale > 1.05:                                   # only when upscaling
+        img = img.filter(ImageFilter.UnsharpMask(radius=2.2, percent=120, threshold=2))
+    return img
 
 def fit(img, max_w, max_h):
     """
