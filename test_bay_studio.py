@@ -114,6 +114,51 @@ def t_parse_real_scripts():
             true(s["narration"].strip(), f"{f}: scene {i+1} has no narration")
             true(s["image"].strip(), f"{f}: scene {i+1} has no image prompt")
 
+# ── auto scene segmentation ───────────────────────────────────────────
+def t_long_narration_is_split():
+    """A raw story with no ## breaks must not become one giant scene."""
+    body = " ".join(f"Sentence number {i} tells a small part of the story."
+                    for i in range(60))          # ~540 words
+    with tempfile.NamedTemporaryFile("w", suffix=".txt", delete=False) as f:
+        f.write("# T\n" + body + "\n")
+        p = f.name
+    try:
+        _, _, scenes = B.parse_script(p)
+        true(len(scenes) > 5, f"long story split into only {len(scenes)} scene(s)")
+        for s in scenes:
+            true(len(s["narration"].split()) <= B.SCENE_MAX_WORDS + 30,
+                 "a segmented scene is still too long")
+            true(s["image"].strip(), "a segmented scene has no image prompt")
+    finally:
+        os.unlink(p)
+
+def t_short_scenes_untouched():
+    """A tidy hand-written script keeps exactly the scenes it declares."""
+    with tempfile.NamedTemporaryFile("w", suffix=".txt", delete=False) as f:
+        f.write("# T\n## a room\nShort one.\n## a street\nShort two.\n")
+        p = f.name
+    try:
+        _, _, scenes = B.parse_script(p)
+        eq(len(scenes), 2, "short scenes should pass through untouched: ")
+        eq(scenes[0]["image"], "a room")
+    finally:
+        os.unlink(p)
+
+def t_segment_keeps_all_narration():
+    text = " ".join(f"Word{i} here is part of it." for i in range(80))
+    segs = B.auto_segment(text)
+    joined = " ".join(s["narration"] for s in segs)
+    eq(len(joined.split()), len(text.split()), "segmentation lost or added words: ")
+
+def t_visual_prompt_prefers_concrete():
+    sents = ["I want you to understand something deep.",
+             "She sat alone at the kitchen table by the window."]
+    p = B.auto_segment(" ".join(sents))
+    # the concrete sentence should drive the image, not the meta one
+    img = p[0]["image"].lower()
+    true("kitchen" in img or "window" in img or "table" in img,
+         f"visual prompt ignored the concrete sentence: {img!r}")
+
 # ── word grouping ─────────────────────────────────────────────────────
 def fake_words(spec):
     """[(text, start, dur)] -> the engine's (start, dur, text) tuples."""
@@ -324,6 +369,22 @@ def t_hook_short_story_not_clipped():
     scenes = [dict(narration="Just three words.")]
     hook = B.hook_from_scenes(scenes, max_words=40)
     true(not hook.endswith("…"), "a short story should not be clipped")
+
+def t_hook_prefers_the_dramatic_line():
+    """The hook picker should choose the shocking beat over flat set-up."""
+    scenes = [dict(narration=(
+        "It was a normal Tuesday. I made coffee and read the news. "
+        "The weather was mild and the traffic was light. "
+        "Then my husband looked at our newborn and said: "
+        '"I need a DNA test before I sign the birth certificate." '
+        "The room went cold."))]
+    hook = B.best_hook(scenes)
+    true("DNA test" in hook, f"hook missed the dramatic line: {hook!r}")
+
+def t_drama_score_ranks_shock_above_calm():
+    calm  = B._drama_score("We ate dinner and talked about the garden.")
+    shock = B._drama_score('He said: "The affair is over." She was exposed.')
+    true(shock > calm, f"shock {shock} should outscore calm {calm}")
 
 def t_colorize_keeps_all_words():
     hook = '"You have been replaced," my husband said. She owed $580,000.'
@@ -643,6 +704,12 @@ def main():
             ("rejects a script with no narration", t_parse_empty_script_rejected),
             ("every shipped script parses", t_parse_real_scripts),
         ]),
+        ("auto scene split", [
+            ("a long story splits into scenes", t_long_narration_is_split),
+            ("short scenes pass through", t_short_scenes_untouched),
+            ("segmentation keeps every word", t_segment_keeps_all_narration),
+            ("image prompt prefers concrete detail", t_visual_prompt_prefers_concrete),
+        ]),
         ("narrator", [
             ("an explicit @ narrator wins", t_explicit_narrator_wins),
             ("only the first @ line counts", t_first_narrator_line_wins),
@@ -695,6 +762,8 @@ def main():
         ("thumbnail", [
             ("hook trims a long opening", t_hook_from_scenes_trims),
             ("a short story is not clipped", t_hook_short_story_not_clipped),
+            ("hook prefers the dramatic line", t_hook_prefers_the_dramatic_line),
+            ("drama score ranks shock above calm", t_drama_score_ranks_shock_above_calm),
             ("colorize keeps every word", t_colorize_keeps_all_words),
             ("money turns red", t_colorize_money_is_red),
             ("quotes get an accent colour", t_colorize_quotes_get_accent),

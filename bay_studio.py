@@ -93,6 +93,18 @@ def parse_script(path):
     if not scenes:
         raise SystemExit("script has no narration")
 
+    # Any scene whose narration runs long — most of all a raw story pasted with
+    # no ## breaks at all — is split into scene-sized beats, each with its own
+    # image, so a long video keeps changing on screen instead of holding one
+    # frozen plate. Short, hand-written scenes pass through untouched.
+    expanded = []
+    for s in scenes:
+        if len(s["narration"].split()) > SCENE_MAX_WORDS:
+            expanded.extend(auto_segment(s["narration"]))
+        else:
+            expanded.append(s)
+    scenes = expanded
+
     for s in scenes:
         if not s["image"]:                            # sensible default plate
             s["image"] = ("cinematic emotional film still, natural light, "
@@ -102,6 +114,69 @@ def parse_script(path):
         body = title + " " + " ".join(s["narration"] for s in scenes)
         narrator = describe_narrator(infer_gender(body))
     return title, narrator, scenes
+
+# ── auto scene segmentation ───────────────────────────────────────────
+SCENE_MAX_WORDS = 60          # a scene longer than this is split
+SCENE_TARGET    = 46          # aim for beats of about this many words
+
+# Concrete things an image model can actually draw, and meta-narration it can't.
+_VISUAL_NOUNS = {
+    "room", "house", "home", "hospital", "bed", "car", "door", "window", "table",
+    "kitchen", "street", "phone", "hand", "hands", "face", "baby", "daughter",
+    "son", "husband", "wife", "mother", "father", "office", "court", "courtroom",
+    "garden", "rain", "night", "morning", "light", "chair", "floor", "dress",
+    "suit", "mirror", "bathroom", "bedroom", "dinner", "coffee", "letter", "ring",
+    "hallway", "porch", "yard", "kids", "children", "family", "nurse", "doctor",
+    "church", "grave", "airport", "station", "school", "desk", "couch", "sofa",
+    "field", "road", "city", "window", "photograph", "photo", "wedding", "gift",
+}
+_META_OPENERS = ("i want you", "i need you", "this is my story", "let me tell",
+                 "i'll tell you", "here is what", "understand this", "sit with that",
+                 "and when i", "but first", "you see")
+
+def _visual_prompt(sentences):
+    """
+    Turn a beat of narration into a backdrop prompt. Prefers the most visual
+    sentence — one naming things a camera could see — over abstract first-person
+    reflection, which the image model cannot render into anything meaningful.
+    """
+    cands = [s for s in sentences if '"' not in s and '“' not in s] or sentences
+
+    def visual_score(s):
+        low = s.lower()
+        if any(low.lstrip().startswith(m) for m in _META_OPENERS):
+            return -1
+        return sum(1 for n in _VISUAL_NOUNS if re.search(rf"\b{n}\b", low))
+
+    best   = max(cands, key=lambda s: (visual_score(s), len(s)))
+    scored = visual_score(best)
+    base   = re.sub(r'["“”‘’\']', "", best)
+    base   = re.sub(r"\s+", " ", base).strip(" .,;:—–")
+    words  = base.split()
+    if len(words) > 16:
+        base = " ".join(words[:16])
+    if not base:
+        return "quiet emotional moment, cinematic"
+    # Abstract beat with nothing to picture — lean on mood instead of the words.
+    if scored <= 0:
+        return f"emotional cinematic moment evoking: {base}"
+    return base
+
+def auto_segment(narration, target=SCENE_TARGET):
+    """Long narration -> [ {image, narration}, ... ] split on sentence bounds."""
+    sents = _sentences(narration)
+    groups, cur, wc = [], [], 0
+    for s in sents:
+        cur.append(s); wc += len(s.split())
+        if wc >= target:
+            groups.append(cur); cur, wc = [], 0
+    if cur:
+        # fold a short tail into the previous beat rather than leaving a stub
+        if groups and wc < target * 0.5:
+            groups[-1].extend(cur)
+        else:
+            groups.append(cur)
+    return [dict(image=_visual_prompt(g), narration=" ".join(g)) for g in groups]
 
 # ── who the narrator is ───────────────────────────────────────────────
 # Whole phrases, not loose words: "wife" alone tells you nothing about the
@@ -679,14 +754,18 @@ def hook_from_scenes(scenes, max_words=42):
     return text + ("…" if clipped else "")
 
 # Words that mark a story's turn — the sort of beat a thumbnail wants to tease.
-DRAMA_WORDS = {
-    "scream", "screaming", "screamed", "secret", "exposed", "betrayed", "betrayal",
-    "divorce", "affair", "mistress", "lover", "debt", "bankrupt", "broke", "lied",
-    "lie", "cheated", "cheating", "pregnant", "dna", "blood", "dead", "died",
-    "death", "funeral", "stole", "stolen", "fraud", "arrested", "police", "court",
-    "judge", "custody", "revenge", "truth", "confess", "confessed", "abandoned",
-    "inheritance", "cancer", "dying", "replaced", "mistake", "positive", "hidden",
-    "discover", "discovered", "found out", "never knew", "shocked", "ruined",
+# The heavy hitters, the shock/reveal words, count for more than the rest.
+SHOCK_WORDS = {
+    "exposed", "betrayed", "betrayal", "affair", "mistress", "secret", "dna",
+    "arrested", "dead", "died", "funeral", "fraud", "custody", "divorce",
+    "pregnant", "cheated", "cheating", "revenge", "abandoned", "screaming",
+    "confession", "confessed", "stole", "stolen", "positive", "cancer",
+}
+DRAMA_WORDS = SHOCK_WORDS | {
+    "scream", "screamed", "lover", "debt", "bankrupt", "broke", "lied", "lie",
+    "blood", "death", "police", "court", "judge", "truth", "inheritance",
+    "dying", "replaced", "mistake", "hidden", "discover", "discovered",
+    "shocked", "ruined", "demanded", "refused", "vanished", "collapsed",
 }
 
 def _sentences(text):
@@ -695,15 +774,19 @@ def _sentences(text):
 
 def _ends_on_beat(sentence):
     return bool(re.search(r"\$\s?\d|\b\d{3,}\b", sentence)
-                or re.search(r'["”]\s*$', sentence.strip()))
+                or re.search(r'["”?!]\s*$', sentence.strip()))
 
 def _drama_score(text):
+    """How attention-grabbing a passage is — higher means a stronger hook."""
     s = 0.0
-    s += 6 * len(re.findall(r'"[^"]*"|“[^”]*”', text))     # quoted speech
+    quotes = re.findall(r'"[^"]*"|“[^”]*”', text)
+    s += 5 * len(quotes)                                    # dialogue draws the eye
+    s += 3 * sum(q.count("?") for q in quotes)             # a pointed question more so
     if re.search(r"\$\s?\d|\b\d{3,}\b", text):              # money or a big number
-        s += 6
+        s += 8
     low = " " + text.lower() + " "
-    s += 2 * sum(1 for w in DRAMA_WORDS if w in low)
+    s += 3 * sum(1 for w in SHOCK_WORDS if w in low)       # reveal words weigh heavy
+    s += 1 * sum(1 for w in DRAMA_WORDS - SHOCK_WORDS if w in low)
     s += text.count("—") + text.count("!")
     return s
 
@@ -723,6 +806,11 @@ def best_hook(scenes, lo=18, hi=48):
     if not sents:
         return hook_from_scenes(scenes)
 
+    def _opens_strong(sentence):
+        head = sentence.lstrip("\"'“‘").lower()
+        return (sentence.lstrip()[:1] in "\"'“"                    # opens on dialogue
+                or any(head.startswith(w) for w in SHOCK_WORDS))
+
     best_text, best_score, best_more = None, -1.0, False
     for i in range(len(sents)):
         words, j, chunk = 0, i, []
@@ -733,7 +821,11 @@ def best_hook(scenes, lo=18, hi=48):
             chunk.append(sents[j]); words += wc; j += 1
             if words >= lo:
                 text  = " ".join(chunk)
-                score = _drama_score(text) + (2 if _ends_on_beat(chunk[-1]) else 0)
+                score = _drama_score(text)
+                if _ends_on_beat(chunk[-1]):     # lands on a punch
+                    score += 3
+                if _opens_strong(chunk[0]):      # grabs from the first word
+                    score += 3
                 if score > best_score:
                     best_score, best_text, best_more = score, text, (j < len(sents))
 

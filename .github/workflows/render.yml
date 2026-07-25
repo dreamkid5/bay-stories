@@ -27,10 +27,10 @@ permissions:
 jobs:
   render:
     runs-on: ubuntu-latest
-    # Long-form videos render many scenes back to back. GitHub allows a job up
-    # to 6 hours; this ceiling stops a wedged run short of that while still
-    # leaving room for a feature-length render.
-    timeout-minutes: 330
+    # Long-form videos render many scenes back to back. GitHub caps a job at
+    # 6 hours (360 min); sit just under it so a genuine feature-length render
+    # gets the most time possible before GitHub kills it.
+    timeout-minutes: 350
 
     steps:
       - uses: actions/checkout@v4
