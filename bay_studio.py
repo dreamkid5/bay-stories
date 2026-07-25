@@ -668,7 +668,7 @@ def _thumb_font(size):
         return load_font(size)
 
 def hook_from_scenes(scenes, max_words=42):
-    """The opening of the story, trimmed to a punchy thumbnail hook."""
+    """The plain opening of the story, trimmed — the fallback hook."""
     words = []
     for sc in scenes:
         words += sc["narration"].split()
@@ -678,36 +678,102 @@ def hook_from_scenes(scenes, max_words=42):
     text = " ".join(words[:max_words]).rstrip(",;:-—– ")
     return text + ("…" if clipped else "")
 
+# Words that mark a story's turn — the sort of beat a thumbnail wants to tease.
+DRAMA_WORDS = {
+    "scream", "screaming", "screamed", "secret", "exposed", "betrayed", "betrayal",
+    "divorce", "affair", "mistress", "lover", "debt", "bankrupt", "broke", "lied",
+    "lie", "cheated", "cheating", "pregnant", "dna", "blood", "dead", "died",
+    "death", "funeral", "stole", "stolen", "fraud", "arrested", "police", "court",
+    "judge", "custody", "revenge", "truth", "confess", "confessed", "abandoned",
+    "inheritance", "cancer", "dying", "replaced", "mistake", "positive", "hidden",
+    "discover", "discovered", "found out", "never knew", "shocked", "ruined",
+}
+
+def _sentences(text):
+    """Split into sentences, keeping their end punctuation (and a trailing quote)."""
+    return [s for s in re.split(r"""(?<=[.!?…"'”’])\s+""", text.strip()) if s.strip()]
+
+def _ends_on_beat(sentence):
+    return bool(re.search(r"\$\s?\d|\b\d{3,}\b", sentence)
+                or re.search(r'["”]\s*$', sentence.strip()))
+
+def _drama_score(text):
+    s = 0.0
+    s += 6 * len(re.findall(r'"[^"]*"|“[^”]*”', text))     # quoted speech
+    if re.search(r"\$\s?\d|\b\d{3,}\b", text):              # money or a big number
+        s += 6
+    low = " " + text.lower() + " "
+    s += 2 * sum(1 for w in DRAMA_WORDS if w in low)
+    s += text.count("—") + text.count("!")
+    return s
+
+def best_hook(scenes, lo=18, hi=48):
+    """
+    The most dramatic contiguous passage in the story, for the thumbnail.
+
+    Slides a window of whole sentences (roughly `lo`–`hi` words) across the
+    entire narration and keeps the highest-scoring one — quotes, money, and
+    turning-point words all pull the score up, with a nudge for windows that
+    END on a beat (a line of dialogue or a dollar figure), the way the
+    reference thumbnail lands on its "$580,000 in debt". Ties fall to the
+    earliest passage, so with no drama at all it degrades to the opening.
+    """
+    full  = " ".join(sc["narration"] for sc in scenes).strip()
+    sents = _sentences(full)
+    if not sents:
+        return hook_from_scenes(scenes)
+
+    best_text, best_score, best_more = None, -1.0, False
+    for i in range(len(sents)):
+        words, j, chunk = 0, i, []
+        while j < len(sents):
+            wc = len(sents[j].split())
+            if chunk and words + wc > hi:
+                break
+            chunk.append(sents[j]); words += wc; j += 1
+            if words >= lo:
+                text  = " ".join(chunk)
+                score = _drama_score(text) + (2 if _ends_on_beat(chunk[-1]) else 0)
+                if score > best_score:
+                    best_score, best_text, best_more = score, text, (j < len(sents))
+
+    if best_text is None:                              # every window below `lo`
+        return hook_from_scenes(scenes)
+    text = best_text.rstrip(",;:—– ")
+    return text + ("…" if best_more else "")
+
 def colorize_hook(hook):
     """
-    -> [(word, colour)]. Quoted speech rotates through the bright accents,
-    anything with money or a number turns red, and every so often a clause
-    goes green — the lively, uneven emphasis the reference thumbnail uses.
+    -> [(word, colour)]. Colours by clause, not by paired quote marks: a hook
+    can begin in the middle of a line of dialogue, so trying to match an
+    opening quote to a closing one mis-fires and paints the narration between
+    two speeches. Instead each clause is judged on its own — money or a number
+    turns it red, any quote mark makes it a rotating accent, and an occasional
+    clause goes green — the lively, uneven emphasis the reference uses. Quote
+    marks stay attached to their words, so no stray " floats on its own.
     """
-    accents = [T_PINK, T_YELLOW, T_GREEN]
+    accents = [T_PINK, T_YELLOW]
     qi = ci = 0
     out = []
-    for part in re.split(r'("[^"]*"|“[^”]*”|\'[^\']*\')', hook):
-        if not part:
+    # Split after clause punctuation — including a closing quote that trails
+    # the punctuation (know."), so an attribution like "She said:" stays its
+    # own clause instead of being swallowed into the neighbouring dialogue.
+    for clause in re.split(r"""(?<=[,.;:!?…"'”’])\s+""", hook.strip()):
+        clause = clause.strip()
+        if not clause:
             continue
-        if part[0] in "\"'“":                       # a quoted span
+        letters = re.sub(r"[^A-Za-z]", "", clause)
+        if re.search(r"[\$]|\d", clause):                # money or a number
+            col = T_RED
+        elif re.search(r"[\"'“”]", clause) and letters:  # a line of dialogue
             col = accents[qi % len(accents)]; qi += 1
-            for w in part.split():
-                out.append((w, col))
+        elif ci % 3 == 2:                                # occasional green beat
+            col = T_GREEN
         else:
-            for clause in re.split(r'(?<=[,.;:—–])\s+', part):
-                clause = clause.strip()
-                if not clause:
-                    continue
-                if re.search(r"[\$]|\d", clause):        # money or a number
-                    col = T_RED
-                elif ci % 3 == 1:
-                    col = T_GREEN
-                else:
-                    col = T_WHITE
-                ci += 1
-                for w in clause.split():
-                    out.append((w, col))
+            col = T_WHITE
+        ci += 1
+        for w in clause.split():
+            out.append((w, col))
     return out
 
 def _wrap_colored(tokens, font, max_w):
@@ -825,7 +891,7 @@ def build(script_path, out_path, work=None, keep_plates=False):
     # A thumbnail written next to the video, sharing its name with a .jpg suffix.
     thumb_path = os.path.splitext(out_path)[0] + ".jpg"
     os.makedirs(os.path.dirname(os.path.abspath(thumb_path)), exist_ok=True)
-    make_thumbnail(hook_from_scenes(scenes), narrator_cut, thumb_path)
+    make_thumbnail(best_hook(scenes), narrator_cut, thumb_path)
     print(f"── thumbnail ──\n   {thumb_path}")
 
     print("\n── render ──")
