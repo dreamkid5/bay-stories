@@ -509,8 +509,27 @@ def t_gender_inference():
         eq(B.infer_gender(txt), "male", f"{txt!r} -> ")
 
 def t_gender_default_when_ambiguous():
-    eq(B.infer_gender("The house was empty. Nobody came home."), "male",
+    # With no self-reference and no romantic-pronoun skew, these stories skew
+    # female-narrated, so that is the safer default.
+    eq(B.infer_gender("The house was empty. Nobody came home."), "female",
        "ambiguous text should fall back to the default: ")
+
+def t_gender_from_partner_pronouns():
+    """No 'my husband', but a story steeped in 'he/his' is told by a woman."""
+    she_leaves_him = ("I found the texts on his phone. His mother watched as I "
+                      "read them. He begged me. I took his ring off and left him.")
+    eq(B.infer_gender(she_leaves_him), "female",
+       "a story about 'him' should read as a female narrator: ")
+    he_leaves_her = ("She had been lying for months. Her sister knew. I packed "
+                     "her things and told her to go. She cried but I was done.")
+    eq(B.infer_gender(he_leaves_her), "male",
+       "a story about 'her' should read as a male narrator: ")
+
+def t_daughters_father_reads_male_by_role():
+    """Address forms ('the only father', 'Goodnight Dad') must read as male."""
+    text = ("I raised my daughters alone. I was the only father who also showed "
+            "up as the mother. Goodnight Dad, they said every night.")
+    eq(B.infer_gender(text), "male")
 
 def t_describe_narrator_matches_gender():
     true("woman" in B.describe_narrator("female").lower(), "female description")
@@ -715,6 +734,8 @@ def main():
             ("only the first @ line counts", t_first_narrator_line_wins),
             ("a narrator is inferred when absent", t_narrator_inferred_when_absent),
             ("gender is inferred from the text", t_gender_inference),
+            ("gender from partner pronouns", t_gender_from_partner_pronouns),
+            ("a father story reads male by role", t_daughters_father_reads_male_by_role),
             ("gender defaults when ambiguous", t_gender_default_when_ambiguous),
             ("the description matches the gender", t_describe_narrator_matches_gender),
             ("the daughters story reads male", t_daughters_story_reads_male),

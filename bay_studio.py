@@ -236,35 +236,54 @@ def auto_segment(narration, i_subject="a young person", target=SCENE_TARGET):
 # ── who the narrator is ───────────────────────────────────────────────
 # Whole phrases, not loose words: "wife" alone tells you nothing about the
 # speaker, but "my wife" means the speaker is telling it from a husband's side.
+# Phrases that pin the SPEAKER's own gender — the strongest signal there is.
 _MALE_CUES = [
-    "my wife", "as a father", "i am a father", "i'm a father", "single father",
-    "single dad", "as a husband", "as a man", "i am a man", "i'm a man",
-    "called me dad", "called me daddy", "call me dad", "their father",
-    "as their dad", "being a dad", "a father of", "widower",
+    "my wife", "my girlfriend", "my ex-wife", "my ex wife", "as a father",
+    "i am a father", "i'm a father", "single father", "single dad", "as a husband",
+    "as a man", "i am a man", "i'm a man", "as a dad", "as the father",
+    "as their father", "the only father", "only father", "i was a father",
+    "i became a father", "called me dad", "called me daddy", "call me dad",
+    "goodnight dad", "love you dad", "hey dad", "thanks dad", "their dad",
+    "i'm their dad", "their father", "as their dad", "being a dad", "a father of",
+    "widower", "my wife's", "she married me",
 ]
 _FEMALE_CUES = [
-    "my husband", "as a mother", "i am a mother", "i'm a mother", "single mother",
-    "single mom", "as a wife", "as a woman", "i am a woman", "i'm a woman",
-    "called me mom", "called me mommy", "call me mom", "their mother",
-    "as their mom", "being a mom", "a mother of", "widow", "pregnant",
-    "gave birth", "my pregnancy",
+    "my husband", "my boyfriend", "my ex-husband", "my ex husband", "as a mother",
+    "i am a mother", "i'm a mother", "single mother", "single mom", "as a wife",
+    "as a woman", "i am a woman", "i'm a woman", "as a mom", "as the mother",
+    "as their mother", "the only mother", "only mother", "i was a mother",
+    "i became a mother", "called me mom", "called me mommy", "call me mom",
+    "goodnight mom", "love you mom", "hey mom", "thanks mom", "their mom",
+    "i'm their mom", "their mother", "as their mom", "being a mom", "a mother of",
+    "widow", "pregnant", "gave birth", "my pregnancy", "i was pregnant", "in labor",
+    "my husband's", "he married me", "my wedding dress", "my baby",
 ]
 
 def infer_gender(text):
     """
-    Guess the narrator's gender from how they refer to themselves.
+    Guess the narrator's gender, so a story told by a woman gets a woman on
+    screen without anyone writing an `@` line.
 
-    Leans on first-person relationship phrases ("my wife", "as a mother"),
-    which pin the speaker's side of a relationship. When a story gives no such
-    cue it returns "male" as a neutral default — override it with an explicit
-    `@` line, which always wins because it never reaches this function.
+    First it looks for how the speaker names themselves ("my husband", "as a
+    mother", "gave birth") — the surest signal. Failing that, it reads the
+    story's romantic frame: in one of these drama stories the other main person
+    is almost always the narrator's partner, so a story swimming in "he / his /
+    him" is being told by a woman, and one full of "she / her" by a man. Only
+    when there is no signal at all does it fall back to a default. An explicit
+    `@` line always wins — it never reaches this function.
     """
     t = " " + text.lower() + " "
     male   = sum(t.count(c) for c in _MALE_CUES)
     female = sum(t.count(c) for c in _FEMALE_CUES)
-    if female > male:
-        return "female"
-    return "male"
+    if male != female:
+        return "female" if female > male else "male"
+
+    # No self-reference: infer from the partner's pronouns.
+    he  = len(re.findall(r"\b(?:he|him|his)\b", t))
+    she = len(re.findall(r"\b(?:she|her|hers)\b", t))
+    if abs(he - she) >= 3:
+        return "female" if he > she else "male"
+    return "female"     # these stories skew female-narrated; a safer default
 
 def describe_narrator(gender):
     """A young, believable host for the given gender (roughly 16–22)."""
