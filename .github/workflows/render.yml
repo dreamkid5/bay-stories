@@ -56,10 +56,28 @@ jobs:
 
       - name: Work out which scripts to render
         id: pick
+        # Everything the workflow needs comes in through the environment.
+        # Interpolating ${{ }} into the script body would break the instant a
+        # value contained a space, quote, or em-dash — exactly what a story
+        # title used as a filename does — and is an injection risk besides.
         env:
-          STORY: ${{ github.event.inputs.story }}
+          STORY:        ${{ github.event.inputs.story }}
+          SCRIPT_INPUT: ${{ github.event.inputs.script }}
+          EVENT_NAME:   ${{ github.event_name }}
+          BEFORE_SHA:   ${{ github.event.before }}
+          AFTER_SHA:    ${{ github.sha }}
         run: |
           set -euo pipefail
+          # One path per line. Filenames may contain spaces, commas, em-dashes;
+          # the only thing this list cannot contain is a newline, which is fine.
+          : > targets.txt
+
+          list_all() {
+            # A NUL-safe glob that also survives "no matches".
+            shopt -s nullglob
+            for f in scripts/*.txt; do printf '%s\n' "$f"; done
+          }
+
           if [ -n "${STORY:-}" ]; then
             # Pasted story: save it as a script and render just that one.
             mkdir -p scripts
@@ -70,31 +88,27 @@ jobs:
             file="scripts/${slug}.txt"
             printf '%s\n' "$STORY" > "$file"
             echo "Saved pasted story to $file"
-            targets="$file"
-          elif [ -n "${{ github.event.inputs.script }}" ]; then
-            # Advanced: render one named file
-            targets="${{ github.event.inputs.script }}"
-          elif [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
-            # Manual run with nothing specified: do them all
-            targets="$(ls scripts/*.txt 2>/dev/null || true)"
+            printf '%s\n' "$file" >> targets.txt
+          elif [ -n "${SCRIPT_INPUT:-}" ]; then
+            printf '%s\n' "$SCRIPT_INPUT" >> targets.txt
+          elif [ "$EVENT_NAME" = "workflow_dispatch" ]; then
+            list_all >> targets.txt
           else
-            # Push: only what actually changed in this push
-            targets="$(git diff --name-only --diff-filter=ACM \
-                        "${{ github.event.before }}" "${{ github.sha }}" \
-                        -- 'scripts/*.txt' 2>/dev/null || true)"
-            # First push on a branch has no usable "before" commit
-            if [ -z "$targets" ]; then
-              targets="$(ls scripts/*.txt 2>/dev/null || true)"
-            fi
+            # Push: only the scripts this push changed. -z keeps paths intact,
+            # core.quotepath=false stops git from mangling non-ASCII names.
+            git -c core.quotepath=false diff --name-only --diff-filter=ACM -z \
+                "$BEFORE_SHA" "$AFTER_SHA" -- 'scripts/*.txt' 2>/dev/null \
+              | tr '\0' '\n' >> targets.txt || true
+            # First push on a branch has no usable "before": fall back to all.
+            [ -s targets.txt ] || list_all >> targets.txt
           fi
 
-          if [ -z "$targets" ]; then
+          if [ -s targets.txt ]; then
+            echo "Rendering:"; sed 's/^/  /' targets.txt
+            echo "found=true" >> "$GITHUB_OUTPUT"
+          else
             echo "No scripts to render."
             echo "found=false" >> "$GITHUB_OUTPUT"
-          else
-            echo "Rendering:"; echo "$targets" | sed 's/^/  /'
-            echo "found=true" >> "$GITHUB_OUTPUT"
-            { echo "targets<<EOF"; echo "$targets"; echo "EOF"; } >> "$GITHUB_OUTPUT"
           fi
 
       - name: Render
@@ -102,14 +116,21 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p videos
-          while IFS= read -r script; do
+          # Read the list from the file, never from an interpolated string, so
+          # spaces and special characters in paths are preserved exactly.
+          while IFS= read -r script || [ -n "$script" ]; do
             [ -z "$script" ] && continue
             [ -f "$script" ] || { echo "::warning::missing $script"; continue; }
-            name="$(basename "${script%.txt}")"
-            echo "::group::$name"
-            python bay_studio.py --script "$script" --out "videos/${name}.mp4"
+            base="$(basename "${script%.txt}")"
+            # The video/asset name is slugified so a title with spaces, commas
+            # or an em-dash cannot produce an unusable filename downstream.
+            slug="$(printf '%s' "$base" | tr '[:upper:]' '[:lower:]' \
+                    | tr -cs 'a-z0-9' '-' | sed 's/^-*//;s/-*$//' | cut -c1-60)"
+            [ -z "$slug" ] && slug="video"
+            echo "::group::$base"
+            python bay_studio.py --script "$script" --out "videos/${slug}.mp4"
             echo "::endgroup::"
-          done <<< "${{ steps.pick.outputs.targets }}"
+          done < targets.txt
           ls -lh videos/
 
       - name: Upload videos
